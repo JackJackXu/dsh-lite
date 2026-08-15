@@ -42,7 +42,14 @@ function connect() {
   };
   ws.onmessage = (ev) => {
     let frame;
-    try { frame = JSON.parse(String(ev.data)); } catch { return; }
+    try {
+      const parsed = JSON.parse(String(ev.data));
+      // Real dsh mux frames are ServerRequest full forms: { rpcId, payload: {...} }.
+      // Accept both the wrapped form and a bare frame.
+      frame = parsed && typeof parsed === 'object' && parsed.payload && typeof parsed.payload.type === 'string'
+        ? parsed.payload
+        : parsed;
+    } catch { return; }
     if (!frame || typeof frame.type !== 'string') return;
     if (frame.type === 'approval/requested') {
       process.stdout.write(JSON.stringify({
