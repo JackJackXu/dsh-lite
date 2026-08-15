@@ -26,9 +26,8 @@ DSH 官方插件系统实现，与壳完全解耦。
 - **单实例锁**：重复启动只聚焦已有窗口
 - **日志落盘**：`数据目录\logs\stableDSH.log`（壳层）+ `dsh-web.log`（服务完整输出，排错用）
 - **进程树回收**：退出时 `taskkill /T /F`，不留孤儿进程
-- **会话完成通知**：agent 任务跑完弹 Windows 通知，点击回到窗口（独立 watcher 进程，增量读会话日志）
-- **审批/问题提醒**：壳经 WebSocket 直连 dsh 的 `/api/events.mux`，agent 请求审批或发选择题时立即弹通知（窗口最小化也不错过，静默重连）
-- **打开终端**：托盘一键在最近会话目录打开 **Windows Terminal**（无 wt 时回退 PowerShell），现代化外观
+- **通知走网页插件**：任务完成 / 审批 / 选择题通知由 **dsh-web-notify** 插件（浏览器 Web Notification）提供，壳保持轻量
+- **打开终端**：托盘一键在数据目录打开 **Windows Terminal**（无 wt 时回退 PowerShell），现代化外观
 - **dsh 内核自动更新**：启动后自动查 npm 最新版，同意后装进数据目录 `agent\`（overlay 原子切换，失败保留旧版，重启生效）
 - **静默启动**：服务进程无控制台窗口
 - **首次运行**：第一次启动后进网页设置页，用 DSH 官方引导流程填 API Key（独立数据目录，需填一次）
@@ -75,8 +74,8 @@ stableDSH/
 ├── scripts/
 │   ├── fetch-resources.js   # 下载内置 node + dsh（自包含）
 │   ├── after-pack.js        # 打包后补拷 resources（防 node_modules 被剥）
-│   ├── session-watcher.js   # 会话日志监听（独立 node 进程：通知 + 会话目录）
-│   ├── mux-watcher.js       # mux WebSocket 监听（审批/选择题通知）
+│   ├── generate-whale-icon.js # 生成像素鲸鱼图标（sharp）
+│   ├── make-icon-from-png.js # 从用户像素画生成图标
 │   ├── dsh-updater.js       # dsh 内核更新（overlay 原子切换）
 │   └── install-plugin.bat   # 一行命令装插件进 stableDSH
 ├── start-dsh.bat            # 备用启动器（无黑框，调 launcher.vbs）

@@ -11,7 +11,7 @@
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
  *  - Logs to <dataDir>\logs\stableDSH.log for plugin/service debugging.
  */
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification } = require('electron');
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -46,8 +46,6 @@ function resDir() {
 let mainWindow = null;
 let tray = null;
 let dshProc = null;
-let watcherProc = null;
-let lastCwd = null;
 let isQuitting = false;
 let isRestarting = false;
 
@@ -145,7 +143,6 @@ function startDsh() {
     if (m) {
       dshUrl = m[1];
       log('resolved dsh url: ' + dshUrl);
-      startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
     }
   });
   dshProc.stderr.on('data', buf => dshWebLog(buf.toString()));
@@ -192,122 +189,18 @@ function restartDsh() {
   }, 800);
 }
 
-/* ---------------- session watcher (notifications + terminal dir) ---------------- */
-// Runs as a standalone node process (bundled node has zstd support; the
-// Electron main process node does not). Prints JSON lines:
-//   {"event":"turnEnd",...}  -> Windows notification
-//   {"event":"session",cwd}  -> remember the latest working directory
-function startSessionWatcher() {
-  const nodeExe = findNodeExe();
-  const watcherJs = path.join(__dirname, 'scripts', 'session-watcher.js');
-  if (!nodeExe || !fs.existsSync(watcherJs)) { log('session watcher unavailable'); return; }
-  const sessionsDir = path.join(DATA_DIR, 'sessions');
-  fs.mkdirSync(sessionsDir, { recursive: true });
-  watcherProc = spawn(nodeExe, [watcherJs, '--sessions', sessionsDir], {
-    cwd: DATA_DIR,
-    env: Object.assign({}, process.env),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  watcherProc.stdout.on('data', buf => {
-    for (const line of buf.toString().split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.event === 'turnEnd') notifyTurnEnd(msg);
-        else if (msg.event === 'session' && typeof msg.cwd === 'string') {
-          lastCwd = msg.cwd;
-          log('session cwd: ' + lastCwd);
-        }
-      } catch { /* partial line */ }
-    }
-  });
-  watcherProc.on('exit', code => {
-    watcherProc = null;
-    if (!isQuitting) log('session watcher exited, code=' + code);
-  });
-}
-
-function notifyTurnEnd(msg) {
-  const body = msg.title ? '任务完成：「' + msg.title + '」' : '任务完成，点击查看详情';
-  log('task finished: ' + body);
-  // Always notify: Windows toasts do not steal focus; the user asked to know
-  // when a task finishes even with the window open.
-  if (Notification.isSupported()) {
-    const n = new Notification({ title: APP_NAME, body });
-    n.on('click', () => showWindow());
-    n.show();
-  } else if (tray) {
-    tray.displayBalloon({ title: APP_NAME, content: body });
-  }
-}
-
-// Open Windows Terminal (or PowerShell fallback) in the latest session's
-// working directory — modern look, not classic cmd.
+/* ---------------- terminal ---------------- */
+// Open Windows Terminal (or PowerShell fallback) in the data directory
+// (workspace-level; session-level cwd tracking was removed with the shell
+// notifications — notifications now live in the dsh-web-notify plugin).
 function openTerminal() {
-  const dir = lastCwd || DATA_DIR;
+  const dir = DATA_DIR;
   const wt = spawn('wt.exe', ['-d', dir], { windowsHide: true, stdio: 'ignore' });
   wt.on('error', () => {
     // wt.exe missing -> PowerShell window fallback
     try {
       spawn('powershell.exe', ['-NoExit', '-Command', "Set-Location -LiteralPath '" + dir + "'"], { windowsHide: true, stdio: 'ignore' });
     } catch (e) { log('open terminal failed: ' + e.message); }
-  });
-}
-
-/* ---------------- mux watcher: approval & question notifications ---------------- */
-// The dsh web app exposes its mux stream over WebSocket (/api/events.mux);
-// every pending approval / user question arrives there (including a replay of
-// still-pending entries on connect). A standalone node process (bundled node
-// has global WebSocket; the Electron main process node does not) connects and
-// reports attention events over stdout:
-//   {"event":"attention","kind":"approval"|"question",...}
-let muxProc = null;
-
-function notifyAttention(body) {
-  log('attention: ' + body);
-  if (Notification.isSupported()) {
-    const n = new Notification({ title: APP_NAME, body: body || '' });
-    n.on('click', () => showWindow());
-    n.show();
-  } else if (tray) {
-    tray.displayBalloon({ title: APP_NAME, content: body || '' });
-  }
-}
-
-function startMuxWatcher(wsUrl) {
-  if (muxProc && !muxProc.killed) {
-    try { muxProc.kill(); } catch (e) { /* ignore */ }
-  }
-  const nodeExe = findNodeExe();
-  const muxJs = path.join(__dirname, 'scripts', 'mux-watcher.js');
-  if (!nodeExe || !fs.existsSync(muxJs)) { log('mux watcher unavailable'); return; }
-  muxProc = spawn(nodeExe, [muxJs, '--url', wsUrl], {
-    cwd: DATA_DIR,
-    env: Object.assign({}, process.env),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  muxProc.stderr.on('data', buf => log('mux: ' + buf.toString().trim()));
-  muxProc.stdout.on('data', buf => {
-    for (const line of buf.toString().split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.event !== 'attention') continue;
-        if (msg.kind === 'approval') {
-          const reason = msg.reason ? '（' + msg.reason + '）' : '';
-          notifyAttention('需要你的审批：' + msg.toolName + reason);
-        } else if (msg.kind === 'question') {
-          const head = msg.header ? '「' + msg.header + '」' : '';
-          notifyAttention('需要你回答' + head + '：' + (msg.question || '有一个问题等待你回答'));
-        }
-      } catch { /* partial line */ }
-    }
-  });
-  muxProc.on('exit', code => {
-    muxProc = null;
-    if (!isQuitting) log('mux watcher exited, code=' + code);
   });
 }
 
@@ -469,12 +362,6 @@ function showWindow() {
 function quitApp() {
   isQuitting = true;
   stopDsh();
-  if (watcherProc && !watcherProc.killed) {
-    try { watcherProc.kill(); } catch (e) { /* ignore */ }
-  }
-  if (muxProc && !muxProc.killed) {
-    try { muxProc.kill(); } catch (e) { /* ignore */ }
-  }
   app.quit();
 }
 
@@ -490,7 +377,6 @@ if (!gotLock) {
     log('boot: ' + APP_NAME + ' v' + pkg.version);
     log('data dir: ' + DATA_DIR);
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
-    startSessionWatcher();
     // Auto-check for dsh kernel updates shortly after boot (silent; prompts only when newer).
     setTimeout(() => { checkDshUpdates(true); }, 15000);
     probeDsh(ok => {
