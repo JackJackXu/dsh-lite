@@ -34,6 +34,23 @@ const POLL_TIMEOUT = 40000;
 const DATA_DIR = process.env.STABLEDSH_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', APP_NAME);
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'stableDSH.log');
+const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+
+// User settings (persisted). Only notifications toggle for now.
+let notificationsEnabled = true;
+
+function loadSettings() {
+  try {
+    const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    if (typeof s.notifications === 'boolean') notificationsEnabled = s.notifications;
+  } catch { /* first run — defaults */ }
+}
+
+function saveSettings() {
+  try {
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ notifications: notificationsEnabled }, null, 2));
+  } catch { /* ignore */ }
+}
 
 // Bundled runtime dir (resources/). Packaged builds put it OUTSIDE app.asar via
 // extraResources so the spawned system node.exe can run real files:
@@ -278,6 +295,7 @@ function startSessionWatcher() {
 }
 
 function notifyTurnEnd(msg) {
+  if (!notificationsEnabled) return;
   const body = msg.title ? '任务完成：「' + msg.title + '」' : '任务完成，点击查看详情';
   log('task finished: ' + body);
   // Always notify: Windows toasts do not steal focus; the user asked to know
@@ -312,6 +330,7 @@ function openTerminal() {
 // reports attention events over stdout:
 //   {"event":"attention","kind":"approval"|"question",...}
 function notifyAttention(body) {
+  if (!notificationsEnabled) return;
   log('attention: ' + body);
   if (Notification.isSupported()) {
     const n = new Notification({ title: APP_NAME, body: body || '' });
@@ -447,15 +466,23 @@ function loadTrayIcon() {
   return null;
 }
 
-function createTray() {
-  const img = loadTrayIcon();
-  tray = new Tray(img || nativeImage.createEmpty());
-  tray.setToolTip(APP_NAME);
-  const menu = Menu.buildFromTemplate([
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
     { label: 'Open ' + APP_NAME, click: () => showWindow() },
     { label: 'Open Data Directory', click: openDataDir },
     { label: 'Open Log Directory', click: openLogDir },
     { type: 'separator' },
+    {
+      label: notificationsEnabled ? 'Notifications: On' : 'Notifications: Off',
+      type: 'checkbox',
+      checked: notificationsEnabled,
+      click: (item) => {
+        notificationsEnabled = item.checked;
+        saveSettings();
+        if (tray) tray.setContextMenu(buildTrayMenu());
+        log('notifications ' + (notificationsEnabled ? 'enabled' : 'disabled'));
+      },
+    },
     { label: 'Check for dsh Updates', click: () => checkDshUpdates(false) },
     { label: 'Open Terminal (session dir)', click: openTerminal },
     { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
@@ -465,7 +492,13 @@ function createTray() {
     { label: 'About ' + APP_NAME, click: showAbout },
     { label: 'Quit', click: quitApp },
   ]);
-  tray.setContextMenu(menu);
+}
+
+function createTray() {
+  const img = loadTrayIcon();
+  tray = new Tray(img || nativeImage.createEmpty());
+  tray.setToolTip(APP_NAME);
+  tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => showWindow());
 }
 
@@ -615,6 +648,7 @@ if (!gotLock) {
   app.on('second-instance', () => showWindow());
 
   app.whenReady().then(() => {
+    loadSettings();
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
     log('boot: ' + APP_NAME + ' v' + pkg.version);
     log('data dir: ' + DATA_DIR);
