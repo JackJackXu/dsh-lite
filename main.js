@@ -303,7 +303,7 @@ function createTray() {
     { label: 'Open Log Directory', click: openLogDir },
     { type: 'separator' },
     { label: 'Check for dsh Updates', click: () => checkDshUpdates(false) },
-    { label: 'Open Terminal (session dir)', click: openTerminal },
+    { label: 'Open Terminal (data dir)', click: openTerminal },
     { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
     { label: 'Restart DSH Service', click: restartDsh },
     { label: 'Open Plugin Directory', click: openPluginDir },
@@ -325,7 +325,7 @@ function showAbout() {
       'Data: ' + DATA_DIR + '\n' +
       'URL: ' + dshUrl + '\n' +
       'Mode: ' + (findDshEntry()?.includes(resDir()) ? 'bundled' : 'system') + '\n\n' +
-      'A visual skin (mist-terminal) is developed as a DSH plugin separately.',
+      'Notifications (task finished / approval / question) are provided by the dsh-web-notify plugin.',
   });
 }
 
