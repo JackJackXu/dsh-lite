@@ -110,6 +110,53 @@ async function renderPng(raw, N, size) {
     .toBuffer();
 }
 
+// Render one size as a classic BMP-encoded ICO entry (NSIS-compatible; PNG
+// entries inside ICO are rejected by makensis with "invalid icon file size").
+// sharp has no BMP output, so the DIB is written by hand from raw RGBA.
+async function renderIcoEntry(raw, N, size) {
+  const rgba = await sharp(raw, { raw: { width: N, height: N, channels: 4 } })
+    .resize(size, size, { kernel: 'nearest' })
+    .raw()
+    .toBuffer();
+  return dibFromRgba(rgba, size);
+}
+
+function dibFromRgba(rgba, size) {
+  const header = Buffer.alloc(40);
+  header.writeUInt32LE(40, 0);      // biSize
+  header.writeInt32LE(size, 4);     // biWidth
+  header.writeInt32LE(size * 2, 8); // biHeight (XOR + AND mask)
+  header.writeUInt16LE(1, 12);      // biPlanes
+  header.writeUInt16LE(32, 14);     // biBitCount
+  // Pixel rows: bottom-up, BGRA, 32bpp (size*4 per row is already aligned).
+  const pixels = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    const srcY = size - 1 - y;
+    for (let x = 0; x < size; x++) {
+      const si = (srcY * size + x) * 4;
+      const di = (y * size + x) * 4;
+      pixels[di] = rgba[si + 2];     // B
+      pixels[di + 1] = rgba[si + 1]; // G
+      pixels[di + 2] = rgba[si];     // R
+      pixels[di + 3] = rgba[si + 3]; // A
+    }
+  }
+  // AND mask: 1-bit transparent for fully-transparent pixels (MSB first).
+  const andRowBytes = Math.ceil(size / 8);
+  const andMask = Buffer.alloc(andRowBytes * size);
+  for (let y = 0; y < size; y++) {
+    const srcY = size - 1 - y;
+    for (let x = 0; x < size; x++) {
+      if (rgba[(srcY * size + x) * 4 + 3] === 0) {
+        andMask[y * andRowBytes + Math.floor(x / 8)] |= (0x80 >> (x % 8));
+      }
+    }
+  }
+  return Buffer.concat([header, pixels, andMask]);
+}
+
+// Classic ICO container with BMP-encoded entries. Layout: ICONDIR + ALL
+// ICONDIRENTRYs first, then all image data (each entry's offset points here).
 function buildIco(entries) {
   const count = entries.length;
   const header = Buffer.alloc(6);
@@ -117,19 +164,21 @@ function buildIco(entries) {
   header.writeUInt16LE(1, 2);
   header.writeUInt16LE(count, 4);
   let offset = 6 + 16 * count;
-  const chunks = [header];
-  for (const { size, png } of entries) {
+  const entryBufs = [];
+  const dataBufs = [];
+  for (const { size, data } of entries) {
     const e = Buffer.alloc(16);
     e[0] = size >= 256 ? 0 : size;
     e[1] = size >= 256 ? 0 : size;
     e.writeUInt16LE(1, 4);
     e.writeUInt16LE(32, 6);
-    e.writeUInt32LE(png.length, 8);
+    e.writeUInt32LE(data.length, 8);
     e.writeUInt32LE(offset, 12);
-    offset += png.length;
-    chunks.push(e, png);
+    offset += data.length;
+    entryBufs.push(e);
+    dataBufs.push(data);
   }
-  return Buffer.concat(chunks);
+  return Buffer.concat([header, ...entryBufs, ...dataBufs]);
 }
 
 (async () => {
@@ -149,10 +198,14 @@ function buildIco(entries) {
   const raw = gridToRaw(grid, N);
   const root = path.resolve(__dirname, '..');
   const sizes = [16, 32, 48, 64, 128, 256];
-  const entries = [];
-  for (const s of sizes) entries.push({ size: s, png: await renderPng(raw, N, s) });
-  fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(entries));
-  fs.writeFileSync(path.join(root, 'assets', 'icon.png'), entries[entries.length - 1].png);
-  fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), entries[entries.length - 1].png);
-  console.log('icons written: assets/icon.ico (' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
+  const icoEntries = [];
+  const pngEntries = [];
+  for (const s of sizes) {
+    icoEntries.push({ size: s, data: await renderIcoEntry(raw, N, s) });
+    pngEntries.push({ size: s, png: await renderPng(raw, N, s) });
+  }
+  fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(icoEntries));
+  fs.writeFileSync(path.join(root, 'assets', 'icon.png'), pngEntries[pngEntries.length - 1].png);
+  fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), pngEntries[pngEntries.length - 1].png);
+  console.log('icons written: assets/icon.ico (BMP entries, ' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
 })().catch(e => { console.error('failed: ' + e.message); process.exit(1); });

@@ -92,6 +92,22 @@ async function renderPng(size) {
 }
 
 // ICO container with embedded PNG entries (Vista+ supports PNG-compressed icons).
+// Classic ICO with BMP-encoded entries (NSIS-compatible; PNG entries inside
+// ICO are rejected by makensis with "invalid icon file size").
+async function renderIcoEntry(size) {
+  const bmp = await sharp(raw, { raw: { width: W, height: H, channels: 4 } })
+    .resize(size, size, { kernel: 'nearest' })
+    .bmp()
+    .toBuffer();
+  const dib = Buffer.from(bmp.subarray(14, 54));
+  dib.writeInt32LE(size * 2, 8); // biHeight includes the AND mask
+  const xorRows = bmp.subarray(54);
+  const andMask = Buffer.alloc(Math.ceil(size / 8) * size);
+  return Buffer.concat([dib, xorRows, andMask]);
+}
+
+// Classic ICO with BMP-encoded entries. Layout: ICONDIR + ALL ICONDIRENTRYs
+// first, then all image data.
 function buildIco(entries) {
   const count = entries.length;
   const header = Buffer.alloc(6);
@@ -99,8 +115,9 @@ function buildIco(entries) {
   header.writeUInt16LE(1, 2);      // type: icon
   header.writeUInt16LE(count, 4);  // image count
   let offset = 6 + 16 * count;
-  const chunks = [header];
-  for (const { size, png } of entries) {
+  const entryBufs = [];
+  const dataBufs = [];
+  for (const { size, data } of entries) {
     const e = Buffer.alloc(16);
     e[0] = size >= 256 ? 0 : size; // width (0 = 256)
     e[1] = size >= 256 ? 0 : size; // height
@@ -108,22 +125,27 @@ function buildIco(entries) {
     e[3] = 0;                      // reserved
     e.writeUInt16LE(1, 4);         // planes
     e.writeUInt16LE(32, 6);        // bpp
-    e.writeUInt32LE(png.length, 8);
+    e.writeUInt32LE(data.length, 8);
     e.writeUInt32LE(offset, 12);
-    offset += png.length;
-    chunks.push(e, png);
+    offset += data.length;
+    entryBufs.push(e);
+    dataBufs.push(data);
   }
-  return Buffer.concat(chunks);
+  return Buffer.concat([header, ...entryBufs, ...dataBufs]);
 }
 
 (async () => {
   const root = path.resolve(__dirname, '..');
   const sizes = [16, 32, 48, 64, 128, 256];
-  const entries = [];
-  for (const s of sizes) entries.push({ size: s, png: await renderPng(s) });
+  const icoEntries = [];
+  const pngEntries = [];
+  for (const s of sizes) {
+    icoEntries.push({ size: s, data: await renderIcoEntry(s) });
+    pngEntries.push({ size: s, png: await renderPng(s) });
+  }
 
-  fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(entries));
-  fs.writeFileSync(path.join(root, 'assets', 'icon.png'), entries[entries.length - 1].png);
-  fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), entries[entries.length - 1].png);
-  console.log('icons written: assets/icon.ico (' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
+  fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(icoEntries));
+  fs.writeFileSync(path.join(root, 'assets', 'icon.png'), pngEntries[pngEntries.length - 1].png);
+  fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), pngEntries[pngEntries.length - 1].png);
+  console.log('icons written: assets/icon.ico (BMP entries, ' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
 })().catch(e => { console.error('icon generation failed: ' + e.message); process.exit(1); });
