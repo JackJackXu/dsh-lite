@@ -3,7 +3,8 @@ rem install-plugin.bat - install a DSH plugin bundle into stableDSH (ASCII only)
 rem usage: install-plugin.bat <path-to-plugin-bundle>
 setlocal
 set "DATA=%LOCALAPPDATA%\stableDSH"
-set "RES=%~dp0resources"
+rem %~dp0 ends with a backslash and is the scripts\ dir; go up one level to the project root
+set "RES=%~dp0..\resources"
 set "DENTRY=%RES%\dsh\node_modules\@deepseek-ai\dsh\lib\bin.js"
 
 if "%~1"=="" (
