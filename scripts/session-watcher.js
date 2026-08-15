@@ -102,8 +102,9 @@ class SessionWatcher {
     // Defer the first scan so the app window paints first; batch it to avoid
     // a startup stall when many session logs exist.
     setImmediate(() => this.scan(4));
+    // NOTE: standalone process — the interval MUST NOT be unref()ed, otherwise
+    // the process exits after the first scan and never watches again.
     this.timer = setInterval(() => this.scan(), intervalMs);
-    if (this.timer.unref) this.timer.unref();
   }
 
   stop() {

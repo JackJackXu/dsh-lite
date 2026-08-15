@@ -16,6 +16,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const updater = require('./scripts/dsh-updater.js');
 
 const APP_NAME = 'stableDSH';
 // The service is started with --port 0 so the OS assigns a free port (never
@@ -73,6 +74,9 @@ function findNodeExe() {
 }
 
 function findDshEntry() {
+  // Update overlay first (dsh kernel updates install here), then bundled, then system.
+  const overlay = path.join(DATA_DIR, 'agent', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  if (fs.existsSync(overlay)) return overlay;
   const builtin = path.join(resDir(), 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
   if (fs.existsSync(builtin)) return builtin;
   const candidates = [
@@ -225,14 +229,14 @@ function startSessionWatcher() {
 
 function notifyTurnEnd(msg) {
   log('task finished: ' + (msg.title || '') + ' | ' + (msg.body || ''));
-  if (!mainWindow || mainWindow.isMinimized()) {
-    if (Notification.isSupported()) {
-      const n = new Notification({ title: msg.title || APP_NAME, body: msg.body || '' });
-      n.on('click', () => showWindow());
-      n.show();
-    } else if (tray) {
-      tray.displayBalloon({ title: msg.title || APP_NAME, content: msg.body || '' });
-    }
+  // Always notify: Windows toasts do not steal focus; the user asked to know
+  // when a task finishes even with the window open.
+  if (Notification.isSupported()) {
+    const n = new Notification({ title: msg.title || APP_NAME, body: msg.body || '' });
+    n.on('click', () => showWindow());
+    n.show();
+  } else if (tray) {
+    tray.displayBalloon({ title: msg.title || APP_NAME, content: msg.body || '' });
   }
 }
 
@@ -247,6 +251,73 @@ function openTerminal() {
       spawn('powershell.exe', ['-NoExit', '-Command', "Set-Location -LiteralPath '" + dir + "'"], { windowsHide: true, stdio: 'ignore' });
     } catch (e) { log('open terminal failed: ' + e.message); }
   });
+}
+
+/* ---------------- dsh kernel updates (overlay) ---------------- */
+function currentDshVersion() {
+  const entry = findDshEntry();
+  return entry ? updater.installedVersion(entry) : null;
+}
+
+// Check for a newer @deepseek-ai/dsh on npm. silent: only report problems when
+// the user asked manually. Returns after prompting/installing.
+async function checkDshUpdates(silent) {
+  const latest = await updater.fetchLatestVersion();
+  if (!latest) {
+    if (!silent) dialog.showMessageBox(mainWindow, { type: 'warning', title: 'Check Updates', message: 'Could not reach npm registry.' });
+    return;
+  }
+  const current = currentDshVersion();
+  if (current && updater.compareVersions(latest.version, current) <= 0) {
+    if (!silent) dialog.showMessageBox(mainWindow, { type: 'info', title: 'Check Updates', message: APP_NAME + ' is up to date (dsh ' + current + ').' });
+    return;
+  }
+  const r = await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: 'dsh Update Available',
+    message: 'New dsh version: ' + latest.version + (current ? ' (current ' + current + ')' : ''),
+    detail: 'Install now? The update is installed into your data directory and the old version is kept as a fallback.',
+    buttons: ['Update Now', 'Later'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (r.response === 0) await runDshUpdate(latest);
+}
+
+async function runDshUpdate(latest) {
+  const nodeExe = findNodeExe();
+  const npmCli = path.join(resDir(), 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (!nodeExe || !fs.existsSync(npmCli)) {
+    dialog.showMessageBox(mainWindow, { type: 'error', title: 'Update Failed', message: 'Bundled npm not found.' });
+    return;
+  }
+  const stagingDir = path.join(DATA_DIR, 'agent-staging');
+  const agentDir = path.join(DATA_DIR, 'agent');
+  log('dsh update: installing ' + latest.version + ' to staging...');
+  const installed = await new Promise(resolve => {
+    updater.installToStaging({ nodeExe, npmCli, version: latest.version, registry: latest.registry, stagingDir, onExit: resolve });
+  });
+  if (!installed) {
+    log('dsh update: install failed (old version kept)');
+    dialog.showMessageBox(mainWindow, { type: 'error', title: 'Update Failed', message: 'Install failed. The previous version is kept.' });
+    return;
+  }
+  if (!updater.commitOverlay(stagingDir, agentDir)) {
+    log('dsh update: commit failed (rolled back)');
+    dialog.showMessageBox(mainWindow, { type: 'error', title: 'Update Failed', message: 'Could not activate the update. Rolled back to the previous version.' });
+    return;
+  }
+  log('dsh update: activated ' + latest.version + ' (overlay)');
+  const rr = await dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: 'Update Ready',
+    message: 'dsh ' + latest.version + ' installed.',
+    detail: 'Restart the DSH service to use it.',
+    buttons: ['Restart Now', 'Later'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (rr.response === 0) restartDsh();
 }
 
 /* ---------------- paths ---------------- */
@@ -280,6 +351,7 @@ function createTray() {
     { label: 'Open Data Directory', click: openDataDir },
     { label: 'Open Log Directory', click: openLogDir },
     { type: 'separator' },
+    { label: 'Check for dsh Updates', click: () => checkDshUpdates(false) },
     { label: 'Open Terminal (session dir)', click: openTerminal },
     { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
     { label: 'Restart DSH Service', click: restartDsh },
@@ -358,6 +430,8 @@ if (!gotLock) {
     log('data dir: ' + DATA_DIR);
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     startSessionWatcher();
+    // Auto-check for dsh kernel updates shortly after boot (silent; prompts only when newer).
+    setTimeout(() => { checkDshUpdates(true); }, 15000);
     probeDsh(ok => {
       if (!ok) startDsh();
       waitForDsh(ready => {
