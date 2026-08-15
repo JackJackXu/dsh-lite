@@ -11,7 +11,7 @@
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
  *  - Logs to <dataDir>\logs\stableDSH.log for plugin/service debugging.
  */
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification } = require('electron');
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -551,6 +551,54 @@ function quitApp() {
   app.quit();
 }
 
+/* ---------------- security hardening & window health ---------------- */
+// Least-privilege permissions (borrowed from bruc3van/dsh-desktop): the web UI
+// only needs clipboard write + fullscreen; cameras/mics/devices are denied.
+const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen']);
+
+function installSecurityHooks() {
+  try {
+    session.defaultSession.setPermissionRequestHandler((_c, permission, cb) => cb(ALLOWED_PERMISSIONS.has(permission)));
+    session.defaultSession.setPermissionCheckHandler((_c, permission) => ALLOWED_PERMISSIONS.has(permission));
+    session.defaultSession.setDevicePermissionHandler(() => false);
+  } catch (e) { log('permission handler setup failed: ' + e.message); }
+  // Every webContents: deny popup windows, send http(s) links to the system
+  // browser, block navigation away from the dsh origin.
+  app.on('web-contents-created', (_e, contents) => {
+    contents.setWindowOpenHandler(({ url }) => {
+      try {
+        const p = new URL(url);
+        if (p.protocol === 'http:' || p.protocol === 'https:') shell.openExternal(url);
+      } catch { /* malformed url */ }
+      return { action: 'deny' };
+    });
+    contents.on('will-navigate', (event, url) => {
+      const origin = (() => { try { return new URL(dshUrl).origin; } catch { return ''; } })();
+      if (origin === '' || !url.startsWith(origin)) event.preventDefault();
+    });
+  });
+}
+
+// System resume / long-idle: re-check that the service is alive and the window
+// shows the right URL (a blank page after sleep is a known Electron gap).
+function installWakeRecovery() {
+  powerMonitor.on('resume', () => {
+    log('system resumed — checking window health');
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed() || isQuitting) return;
+      probeDsh(ok => {
+        if (!ok) {
+          log('dsh not reachable after resume — restarting service');
+          restartDsh();
+        } else if (mainWindow.webContents.getURL() !== dshUrl) {
+          log('window URL stale after resume — reloading');
+          mainWindow.loadURL(dshUrl);
+        }
+      });
+    }, 3000);
+  });
+}
+
 /* ---------------- app lifecycle ---------------- */
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -563,6 +611,8 @@ if (!gotLock) {
     log('boot: ' + APP_NAME + ' v' + pkg.version);
     log('data dir: ' + DATA_DIR);
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
+    installSecurityHooks();
+    installWakeRecovery();
     startSessionWatcher();
     // Auto-check for dsh kernel updates shortly after boot (silent; prompts only when newer).
     setTimeout(() => { checkDshUpdates(true); }, 15000);
