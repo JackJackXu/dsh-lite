@@ -19,12 +19,13 @@ DSH 官方插件系统实现，与壳完全解耦。
 
 ## 功能
 
-- **独立服务**：启动时探测 `127.0.0.1:3081`，无服务则自动拉起（内置 node + dsh）
+- **独立服务**：启动时自动拉起 dsh web，**端口由系统分配**（`--port 0`，从 stdout 解析），永不冲突
 - **数据隔离**：所有配置/会话/凭证/插件都在 `%LOCALAPPDATA%\stableDSH`，**绝不触碰 `~/.dsh`**
 - **QQ 式托盘**：点窗口 × 隐藏到托盘，不退出
 - **托盘菜单**：打开窗口 / 数据目录 / 日志目录 / 重新加载 / 重启服务 / 插件目录 / 关于 / 退出
 - **单实例锁**：重复启动只聚焦已有窗口
-- **日志落盘**：`数据目录\logs\stableDSH.log`（服务启动、插件加载排错用）
+- **日志落盘**：`数据目录\logs\stableDSH.log`（壳层）+ `dsh-web.log`（服务完整输出，排错用）
+- **进程树回收**：退出时 `taskkill /T /F`，不留孤儿进程
 - **静默启动**：服务进程无控制台窗口
 - **首次运行**：第一次启动后进网页设置页，用 DSH 官方引导流程填 API Key（独立数据目录，需填一次）
 
@@ -69,6 +70,7 @@ stableDSH/
 ├── package.json             # 项目定义 + electron-builder 配置
 ├── scripts/
 │   ├── fetch-resources.js   # 下载内置 node + dsh（自包含）
+│   ├── after-pack.js        # 打包后补拷 resources（防 node_modules 被剥）
 │   └── install-plugin.bat   # 一行命令装插件进 stableDSH
 ├── start-dsh.bat            # 备用启动器（无黑框，调 launcher.vbs）
 ├── launcher.vbs             # 静默启动 electron（ASCII，无编码坑）
@@ -79,7 +81,7 @@ stableDSH/
 │   └── whale.svg            # 图标源文件（官方 favicon 放大版）
 ├── resources/               # 内置运行时（fetch-resources.js 生成）
 │   ├── node/                # 便携版 node.exe + npm
-│   └── dsh/                 # @deepseek-ai/dsh 完整安装 + pnpm
+│   └── dsh/                 # @deepseek-ai/dsh 完整安装
 └── release/                 # 打包产物输出目录
 ```
 
@@ -98,7 +100,7 @@ stableDSH/
 
 ## 高级
 
-- 换端口：`set STABLEDSH_PORT=4000 && stableDSH.exe`
+- 换端口（仅作解析失败兜底）：`set STABLEDSH_PORT=4000 && stableDSH.exe`
 - 换数据目录：`set STABLEDSH_HOME=D:\my-dsh && stableDSH.exe`
 
 ## 已知事项

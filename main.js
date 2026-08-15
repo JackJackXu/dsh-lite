@@ -6,7 +6,7 @@
  *    falls back to the system node/dsh when not bundled (dev mode).
  *  - Isolated data: DSH_HOME = %LOCALAPPDATA%\stableDSH (independent config,
  *    sessions, plugins — never touches the user's ~/.dsh).
- *  - Independent port: 3081 (override with STABLEDSH_PORT env).
+ *  - Port: OS-assigned free port (--port 0, parsed from stdout); no conflicts.
  *  - Single instance: a second launch focuses the existing window.
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
  *  - Logs to <dataDir>\logs\stableDSH.log for plugin/service debugging.
@@ -18,8 +18,12 @@ const fs = require('fs');
 const http = require('http');
 
 const APP_NAME = 'stableDSH';
-const DSH_PORT = Number(process.env.STABLEDSH_PORT || 3081);
-const DSH_URL = 'http://127.0.0.1:' + DSH_PORT;
+// The service is started with --port 0 so the OS assigns a free port (never
+// conflicts). The real URL is parsed from dsh's stdout line:
+//   "dsh web: http://127.0.0.1:<port>"
+// FALLBACK_PORT is used only if that line never arrives.
+const FALLBACK_PORT = Number(process.env.STABLEDSH_PORT || 3081);
+let dshUrl = 'http://127.0.0.1:' + FALLBACK_PORT;
 const POLL_INTERVAL = 800;
 const POLL_TIMEOUT = 40000;
 
@@ -79,7 +83,7 @@ function findDshEntry() {
 
 /* ---------------- DSH service probe (health check) ---------------- */
 function probeDsh(cb) {
-  const req = http.get(DSH_URL, res => {
+  const req = http.get(dshUrl, res => {
     let body = '';
     res.on('data', c => {
       body += c;
@@ -103,23 +107,41 @@ function waitForDsh(cb) {
 }
 
 /* ---------------- service lifecycle ---------------- */
+function dshWebLog(data) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(LOG_DIR, 'dsh-web.log'), data);
+  } catch { /* ignore */ }
+}
+
 function startDsh() {
   const entry = findDshEntry();
   if (!entry) { log('dsh entry not found (bundled or system)'); return null; }
   const nodeExe = findNodeExe();
   if (!nodeExe) { log('node.exe not found'); return null; }
   const mode = entry.includes(resDir()) ? 'bundled' : 'system';
-  log('starting dsh web via ' + mode + ' node: ' + nodeExe);
+  log('starting dsh web via ' + mode + ' node: ' + nodeExe + ' (--port 0, OS-assigned)');
   const env = Object.assign({}, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
   env.DSH_HOME = DATA_DIR;   // isolated data directory
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  dshProc = spawn(nodeExe, [entry, 'web', '--port', String(DSH_PORT)], {
+  // Capture stdout to parse the announced port and to persist dsh-web.log.
+  dshProc = spawn(nodeExe, [entry, 'web', '--port', '0'], {
     cwd: DATA_DIR,
     env,
-    stdio: 'ignore',
+    stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  dshProc.stdout.on('data', buf => {
+    const text = buf.toString();
+    dshWebLog(text);
+    const m = /dsh web: (https?:\/\/127\.0\.0\.1:\d+)/.exec(text);
+    if (m) {
+      dshUrl = m[1];
+      log('resolved dsh url: ' + dshUrl);
+    }
+  });
+  dshProc.stderr.on('data', buf => dshWebLog(buf.toString()));
   dshProc.on('exit', code => {
     log('dsh service exited, code=' + code);
     dshProc = null;
@@ -133,9 +155,15 @@ function startDsh() {
   return dshProc;
 }
 
+// Kill the whole process tree: dsh spawns pwsh/agent children that would
+// otherwise linger after exit.
 function stopDsh() {
-  if (dshProc && !dshProc.killed) {
-    try { dshProc.kill(); } catch (e) { /* ignore */ }
+  if (dshProc && dshProc.pid) {
+    try {
+      spawn('taskkill', ['/PID', String(dshProc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    } catch (e) {
+      try { dshProc.kill(); } catch (x) { /* ignore */ }
+    }
   }
 }
 
@@ -150,7 +178,7 @@ function restartDsh() {
       isRestarting = false;
       if (tray) tray.setToolTip(APP_NAME);
       if (mainWindow) {
-        if (ok) mainWindow.loadURL(DSH_URL);
+        if (ok) mainWindow.loadURL(dshUrl);
         else log('service restart timed out');
       }
     });
@@ -188,7 +216,7 @@ function createTray() {
     { label: 'Open Data Directory', click: openDataDir },
     { label: 'Open Log Directory', click: openLogDir },
     { type: 'separator' },
-    { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(DSH_URL); } },
+    { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
     { label: 'Restart DSH Service', click: restartDsh },
     { label: 'Open Plugin Directory', click: openPluginDir },
     { type: 'separator' },
@@ -207,7 +235,7 @@ function showAbout() {
     message: APP_NAME + ' ' + pkg.version,
     detail: 'DeepSeek Harness desktop wrapper (self-contained)\n\n' +
       'Data: ' + DATA_DIR + '\n' +
-      'Port: ' + DSH_PORT + '\n' +
+      'URL: ' + dshUrl + '\n' +
       'Mode: ' + (findDshEntry()?.includes(resDir()) ? 'bundled' : 'system') + '\n\n' +
       'A visual skin (mist-terminal) is developed as a DSH plugin separately.',
   });
@@ -228,7 +256,7 @@ function createWindow() {
     webPreferences: { nodeIntegration: false, contextIsolation: true },
   });
 
-  mainWindow.loadURL(DSH_URL);
+  mainWindow.loadURL(dshUrl);
 
   mainWindow.on('close', e => {
     if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
@@ -260,7 +288,7 @@ if (!gotLock) {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
     log('boot: ' + APP_NAME + ' v' + pkg.version);
     log('data dir: ' + DATA_DIR);
-    log('port: ' + DSH_PORT);
+    log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     probeDsh(ok => {
       if (!ok) startDsh();
       waitForDsh(ready => {
