@@ -1,0 +1,158 @@
+'use strict';
+
+// Generate stableDSH icons from a user-drawn 32x32 pixel-art PNG.
+//
+// The source is a 640x640 PNG = 32x32 grid scaled 20x. This script:
+//   1. downsamples to a 32x32 grid (majority color per cell),
+//   2. turns the outer white background transparent (flood fill from edges;
+//      interior whites such as the mouth are kept),
+//   3. renders 256px PNG + multi-size ICO.
+//
+// Usage: node scripts/make-icon-from-png.js <source.png>
+// Outputs: assets/icon.ico, assets/icon.png, assets/whale-pixel.png
+
+const path = require('node:path');
+const fs = require('node:fs');
+
+const SHARP = 'C:/Users/XKangA/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/sharp';
+let sharp;
+try {
+  sharp = require(SHARP);
+} catch (e) {
+  console.error('sharp failed to load: ' + e.message);
+  process.exit(1);
+}
+
+const PALETTE = { D: [20, 38, 96], B: [78, 111, 255], L: [190, 225, 255], W: [255, 255, 255] };
+
+function quantize(r, g, b) {
+  if (r > 245 && g > 245 && b > 245) return 'W';
+  let best = '?', bestD = 1e9;
+  for (const [k, [pr, pg, pb]] of Object.entries(PALETTE)) {
+    const d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
+    if (d < bestD) { bestD = d; best = k; }
+  }
+  return bestD > 12000 ? '?' : best;
+}
+
+async function extractGrid(file) {
+  const { data, info } = await sharp(file).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const W = info.width, H = info.height;
+  const N = 32;
+  const CELL = Math.round(W / N);
+  if (W % N !== 0) console.warn('width ' + W + ' not a multiple of 32; cell=' + CELL);
+  const grid = [];
+  for (let gy = 0; gy < N; gy++) {
+    for (let gx = 0; gx < N; gx++) {
+      const counts = new Map();
+      for (let y = gy * CELL; y < Math.min((gy + 1) * CELL, H); y++) {
+        for (let x = gx * CELL; x < Math.min((gx + 1) * CELL, W); x++) {
+          const i = (y * W + x) * 4;
+          const a = info.channels > 3 ? data[i + 3] : 255;
+          if (a < 128) { counts.set('T', (counts.get('T') || 0) + 1); continue; }
+          const k = quantize(data[i], data[i + 1], data[i + 2]);
+          counts.set(k, (counts.get(k) || 0) + 1);
+        }
+      }
+      let best = '?', bestN = 0;
+      for (const [k, n] of counts) if (n > bestN) { best = k; bestN = n; }
+      grid.push(best);
+    }
+  }
+  return grid;
+}
+
+// Flood fill from the border: any 'W' reachable from the edge becomes
+// transparent background ('T'); interior whites (mouth) stay 'W'.
+function transparentizeBackground(grid, N) {
+  const out = grid.slice();
+  const isBg = new Array(N * N).fill(false);
+  const stack = [];
+  const push = (x, y) => {
+    if (x < 0 || y < 0 || x >= N || y >= N) return;
+    const i = y * N + x;
+    if (isBg[i] || out[i] !== 'W') return;
+    isBg[i] = true;
+    stack.push(i);
+  };
+  for (let x = 0; x < N; x++) { push(x, 0); push(x, N - 1); }
+  for (let y = 0; y < N; y++) { push(0, y); push(N - 1, y); }
+  while (stack.length) {
+    const i = stack.pop();
+    const x = i % N, y = Math.floor(i / N);
+    push(x + 1, y); push(x - 1, y); push(x, y + 1); push(x, y - 1);
+  }
+  for (let i = 0; i < N * N; i++) if (isBg[i]) out[i] = 'T';
+  return out;
+}
+
+function gridToRaw(grid, N) {
+  const raw = Buffer.alloc(N * N * 4);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const ch = grid[y * N + x];
+      const o = (y * N + x) * 4;
+      const c = PALETTE[ch];
+      if (c) {
+        raw[o] = c[0]; raw[o + 1] = c[1]; raw[o + 2] = c[2]; raw[o + 3] = 255;
+      } else {
+        raw[o + 3] = 0;
+      }
+    }
+  }
+  return raw;
+}
+
+async function renderPng(raw, N, size) {
+  return sharp(raw, { raw: { width: N, height: N, channels: 4 } })
+    .resize(size, size, { kernel: 'nearest' })
+    .png()
+    .toBuffer();
+}
+
+function buildIco(entries) {
+  const count = entries.length;
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0);
+  header.writeUInt16LE(1, 2);
+  header.writeUInt16LE(count, 4);
+  let offset = 6 + 16 * count;
+  const chunks = [header];
+  for (const { size, png } of entries) {
+    const e = Buffer.alloc(16);
+    e[0] = size >= 256 ? 0 : size;
+    e[1] = size >= 256 ? 0 : size;
+    e.writeUInt16LE(1, 4);
+    e.writeUInt16LE(32, 6);
+    e.writeUInt32LE(png.length, 8);
+    e.writeUInt32LE(offset, 12);
+    offset += png.length;
+    chunks.push(e, png);
+  }
+  return Buffer.concat(chunks);
+}
+
+(async () => {
+  const src = process.argv[2];
+  if (!src) { console.error('usage: node make-icon-from-png.js <source.png>'); process.exit(1); }
+  const N = 32;
+  let grid = await extractGrid(src);
+  grid = transparentizeBackground(grid, N);
+
+  // ASCII preview of the result (T=transparent)
+  const map = { D: '#', B: 'O', L: '.', W: 'w', '?': '?', T: ' ' };
+  console.log('--- extracted 32x32 grid (after background removal) ---');
+  for (let y = 0; y < N; y++) {
+    console.log(grid.slice(y * N, (y + 1) * N).map(c => map[c] || '?').join(''));
+  }
+
+  const raw = gridToRaw(grid, N);
+  const root = path.resolve(__dirname, '..');
+  const sizes = [16, 32, 48, 64, 128, 256];
+  const entries = [];
+  for (const s of sizes) entries.push({ size: s, png: await renderPng(raw, N, s) });
+  fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(entries));
+  fs.writeFileSync(path.join(root, 'assets', 'icon.png'), entries[entries.length - 1].png);
+  fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), entries[entries.length - 1].png);
+  console.log('icons written: assets/icon.ico (' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
+})().catch(e => { console.error('failed: ' + e.message); process.exit(1); });
