@@ -166,6 +166,13 @@ function startDsh(portArg) {
   const env = Object.assign({}, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
   env.DSH_HOME = DATA_DIR;   // isolated data directory
+  // Make the bundled node available to the agent: append (never prepend) the
+  // bundled node dir to PATH, so a machine without Node still lets the agent
+  // run `node`/`npm`, while a machine with its own Node keeps using it.
+  const bundledNodeDir = path.join(resDir(), 'node');
+  if (fs.existsSync(path.join(bundledNodeDir, 'node.exe')) && !(env.PATH || '').split(path.delimiter).includes(bundledNodeDir)) {
+    env.PATH = env.PATH ? env.PATH + path.delimiter + bundledNodeDir : bundledNodeDir;
+  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   // Capture stdout to parse the announced port and to persist dsh-web.log.
   dshProc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
