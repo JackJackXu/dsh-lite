@@ -145,6 +145,7 @@ function startDsh() {
     if (m) {
       dshUrl = m[1];
       log('resolved dsh url: ' + dshUrl);
+      connectMux(); // approval/question notifications via SSE
     }
   });
   dshProc.stderr.on('data', buf => dshWebLog(buf.toString()));
@@ -251,6 +252,87 @@ function openTerminal() {
       spawn('powershell.exe', ['-NoExit', '-Command', "Set-Location -LiteralPath '" + dir + "'"], { windowsHide: true, stdio: 'ignore' });
     } catch (e) { log('open terminal failed: ' + e.message); }
   });
+}
+
+/* ---------------- mux listener: approval & question notifications ---------------- */
+// The dsh web app streams every pending approval / user question over
+// GET /api/events.mux (SSE) — including a replay of still-pending entries on
+// connect. The shell connects as another client and turns those frames into
+// Windows notifications, independent of the web UI (works when minimized).
+let muxAbort = null;
+
+function notifyAttention(title, body) {
+  log('attention: ' + title + ' | ' + body);
+  if (Notification.isSupported()) {
+    const n = new Notification({ title: title || APP_NAME, body: body || '' });
+    n.on('click', () => showWindow());
+    n.show();
+  } else if (tray) {
+    tray.displayBalloon({ title: title || APP_NAME, content: body || '' });
+  }
+}
+
+// One SSE event: accumulate data lines until a blank line, then hand the JSON
+// payload to onFrame. Returns leftover buffer (handles frames split across chunks).
+function feedSse(buf, text, onFrame) {
+  buf += text;
+  let idx;
+  while ((idx = buf.indexOf('\n\n')) >= 0) {
+    const block = buf.slice(0, idx);
+    buf = buf.slice(idx + 2);
+    let data = '';
+    for (const line of block.split('\n')) {
+      if (line.startsWith('data:')) data += line.slice(5).trimStart();
+    }
+    if (!data) continue;
+    try { onFrame(JSON.parse(data)); } catch { /* malformed frame */ }
+  }
+  return buf;
+}
+
+async function connectMux() {
+  if (muxAbort) { muxAbort.abort(); muxAbort = null; }
+  const ctrl = new AbortController();
+  muxAbort = ctrl;
+  let buf = '';
+  for (;;) {
+    if (isQuitting) return;
+    try {
+      const res = await fetch(dshUrl + '/api/events.mux', { signal: ctrl.signal });
+      if (!res.ok || !res.body) throw new Error('mux HTTP ' + res.status);
+      log('mux connected: ' + dshUrl);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf = feedSse(buf, dec.decode(value, { stream: true }), onMuxFrame);
+      }
+      log('mux stream closed');
+    } catch (e) {
+      if (ctrl.signal.aborted || isQuitting) return;
+      log('mux connect failed: ' + e.message + ' (retrying)');
+    }
+    // Reconnect with backoff; also picks up a new port after service restart.
+    await new Promise(r => setTimeout(r, 4000));
+  }
+}
+
+function onMuxFrame(frame) {
+  try {
+    if (frame && typeof frame.type === 'string') {
+      if (frame.type === 'approval/requested') {
+        const tool = frame.toolName || 'tool';
+        notifyAttention('Approval needed: ' + tool, (frame.reason || 'An agent action needs your approval. Click to review.') + ' (session ' + String(frame.sessionId).slice(-8) + ')');
+      } else if (frame.type === 'question/requested') {
+        for (const q of frame.questions || []) {
+          const head = q.header || '';
+          const text = q.question || 'A question needs your answer.';
+          notifyAttention(head ? 'Question: ' + head : 'Question needs your answer', text);
+        }
+      }
+    }
+  } catch (e) { log('mux frame error: ' + e.message); }
 }
 
 /* ---------------- dsh kernel updates (overlay) ---------------- */
