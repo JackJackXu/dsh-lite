@@ -23,36 +23,37 @@ try {
 }
 
 const SPRITE = [
-  '........................................',
-  '........................................',
-  '........................D...............',
-  '.......................DBD.......D......',
-  '.......................DBBD.....DBD.....',
-  '.......................DBBBD..DDBBD.....',
-  '.......................DBBBBDDBBBBD.....',
-  '.......DDDDDDDDD........DBBBBBBBBD......',
-  '......DBBBBBBBBBDD.......DBBBBBBBD......',
-  '.....DBBBBBBBBBBBBDD.....DBBBBBDD.......',
-  '....DBBBBBBBBBBBBBBBDD....DBBBD.........',
-  '...DDBBBBBBBBBBBBBBBBBD..DBBBBD.........',
-  '...DBBBBBBBBBBBBBBBBBBBDDBBBBBD.........',
-  '...DBBBDBBBBBBDBBBBBBBBBBBBBBBD.........',
-  '...DBBBDBBBBBBDBBBBBBBBBBBBBBD..........',
-  '...DBBBBBBBBBBBBBBBBBBBBBBBBBD..........',
-  '...DBBBBWWWWWWWBBBBBBBBDBBBBD...........',
-  '...DDBWWWWWWWWWWWWBBBBBBDBBBD...........',
-  '....DLLWWWWWWWWWWWWDBBBBDDBD............',
-  '.....DLLLWWWWWWWWWWDBBBBBDD.............',
-  '......DDLLLWWWWWWLLLDBBBBBDD............',
-  '........DLLLLLLLLLLLDDBBBBBBD...........',
-  '.........DDDDDDDDDDD..DDDDDDD...........',
-  '........................................',
-  '........................................',
+  '..........................',
+  '..........................',
+  '.........DDDDDD...........',
+  '.......DDBBBBBBD..........',
+  '......DBBBBBBBBBBD........',
+  '.....DBBBBBBBBBBBBD.......',
+  '....DBBBBBBBBBBBBBBD......',
+  '....DBBBBBBBBBBBBBBD......',
+  '...DBBBWWWWWWWWBBBBD......',
+  '...DBBWWWWWWWWWWBBBBD.....',
+  '...DBWLLLLWWWWWWWBBBDD....',
+  '...DBWLLLLLWWWWWWBBBD.....',
+  '...DBBLLLLLLLWWWWBBBBD....',
+  '...DBBBLLLLLLWWWWBBBD.....',
+  '....DBBBLLLLLWWWBBBD......',
+  '.....DBBBBBBBBBBBBD.......',
+  '......DBBBBBBBBBBBBD......',
+  '.......DDBBBBBBBBBBD......',
+  '........DBBBBBBBBBBD......',
+  '........DBBBBBBBBBBD......',
+  '.......DBBBDDDBBBBD.......',
+  '......DBBBD...DBBBD.......',
+  '.....DBBBD.....DBBBD......',
+  '....DBBBD.......DBBD......',
+  '....DBBD.........DD.......',
+  '..........................',
 ];
 
 const PALETTE = { D: '#142660', B: '#4E6FFF', L: '#BEE1FF', W: '#FFFFFF' };
 
-const W = 40;
+const W = SPRITE[0].length;
 const H = SPRITE.length;
 
 function hexToRgb(hex) {
