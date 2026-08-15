@@ -6,7 +6,8 @@
  *    falls back to the system node/dsh when not bundled (dev mode).
  *  - Isolated data: DSH_HOME = %LOCALAPPDATA%\stableDSH (independent config,
  *    sessions, plugins — never touches the user's ~/.dsh).
- *  - Port: OS-assigned free port (--port 0, parsed from stdout); no conflicts.
+ *  - Port: last-used port is reused when free (stable web origin), otherwise
+ *    the OS assigns a free one (parsed from stdout).
  *  - Single instance: a second launch focuses the existing window.
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
  *  - Logs to <dataDir>\logs\stableDSH.log for plugin/service debugging.
@@ -456,7 +457,7 @@ function createTray() {
     { label: 'Open Log Directory', click: openLogDir },
     { type: 'separator' },
     { label: 'Check for dsh Updates', click: () => checkDshUpdates(false) },
-    { label: 'Open Terminal (data dir)', click: openTerminal },
+    { label: 'Open Terminal (session dir)', click: openTerminal },
     { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
     { label: 'Restart DSH Service', click: restartDsh },
     { label: 'Open Plugin Directory', click: openPluginDir },
@@ -478,7 +479,7 @@ function showAbout() {
       'Data: ' + DATA_DIR + '\n' +
       'URL: ' + dshUrl + '\n' +
       'Mode: ' + (findDshEntry()?.includes(resDir()) ? 'bundled' : 'system') + '\n\n' +
-      'Notifications (task finished / approval / question) are provided by the dsh-web-notify plugin.',
+      'Notifications (task finished / approval / question) via built-in watchers.',
   });
 }
 
