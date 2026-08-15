@@ -16,6 +16,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const net = require('net');
 const updater = require('./scripts/dsh-updater.js');
 
 const APP_NAME = 'stableDSH';
@@ -118,19 +119,53 @@ function dshWebLog(data) {
   } catch { /* ignore */ }
 }
 
-function startDsh() {
+// Port persistence: reuse the last used port so the web origin stays stable
+// (localStorage preferences like session grouping survive restarts).
+const PORT_FILE = path.join(DATA_DIR, 'port.txt');
+
+function readLastPort() {
+  try { return Number(fs.readFileSync(PORT_FILE, 'utf8').trim()); } catch { return 0; }
+}
+
+function savePort(port) {
+  try { fs.writeFileSync(PORT_FILE, String(port)); } catch { /* ignore */ }
+}
+
+function portFree(port) {
+  return new Promise(resolve => {
+    const socket = net.connect({ port, host: '127.0.0.1' });
+    socket.on('connect', () => { socket.destroy(); resolve(false); });
+    socket.on('error', () => resolve(true));
+    socket.setTimeout(800, () => { socket.destroy(); resolve(true); });
+  });
+}
+
+// Decide the port argument: reuse lastPort when free, else let the OS pick.
+async function resolvePortArg() {
+  const lastPort = readLastPort();
+  if (lastPort > 0) {
+    if (await portFree(lastPort)) {
+      log('reusing port ' + lastPort);
+      return String(lastPort);
+    }
+    log('port ' + lastPort + ' busy — falling back to random port');
+  }
+  return '0';
+}
+
+function startDsh(portArg) {
   const entry = findDshEntry();
   if (!entry) { log('dsh entry not found (bundled or system)'); return null; }
   const nodeExe = findNodeExe();
   if (!nodeExe) { log('node.exe not found'); return null; }
   const mode = entry.includes(resDir()) ? 'bundled' : 'system';
-  log('starting dsh web via ' + mode + ' node: ' + nodeExe + ' (--port 0, OS-assigned)');
+  log('starting dsh web via ' + mode + ' node: ' + nodeExe + ' (--port ' + portArg + ')');
   const env = Object.assign({}, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
   env.DSH_HOME = DATA_DIR;   // isolated data directory
   fs.mkdirSync(DATA_DIR, { recursive: true });
   // Capture stdout to parse the announced port and to persist dsh-web.log.
-  dshProc = spawn(nodeExe, [entry, 'web', '--port', '0'], {
+  dshProc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
     cwd: DATA_DIR,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -142,6 +177,10 @@ function startDsh() {
     const m = /dsh web: (https?:\/\/127\.0\.0\.1:\d+)/.exec(text);
     if (m) {
       dshUrl = m[1];
+      try {
+        const port = Number(new URL(dshUrl).port);
+        if (port > 0) savePort(port);
+      } catch { /* ignore */ }
       log('resolved dsh url: ' + dshUrl);
     }
   });
@@ -176,8 +215,9 @@ function restartDsh() {
   isRestarting = true;
   if (tray) tray.setToolTip(APP_NAME + ' - restarting...');
   stopDsh();
-  setTimeout(() => {
-    startDsh();
+  setTimeout(async () => {
+    const portArg = await resolvePortArg();
+    startDsh(portArg);
     waitForDsh(ok => {
       isRestarting = false;
       if (tray) tray.setToolTip(APP_NAME);
@@ -413,8 +453,11 @@ if (!gotLock) {
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     // Auto-check for dsh kernel updates shortly after boot (silent; prompts only when newer).
     setTimeout(() => { checkDshUpdates(true); }, 15000);
-    probeDsh(ok => {
-      if (!ok) startDsh();
+    probeDsh(async ok => {
+      if (!ok) {
+        const portArg = await resolvePortArg();
+        startDsh(portArg);
+      }
       waitForDsh(ready => {
         if (!ready) log('DSH service start timeout');
         createWindow();
