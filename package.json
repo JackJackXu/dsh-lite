@@ -1,0 +1,50 @@
+{
+  "name": "stabledsh",
+  "version": "0.1.0",
+  "description": "stableDSH - self-contained DeepSeek Harness desktop app (tray + auto service + isolated data)",
+  "main": "main.js",
+  "author": "stableDSH",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "fetch-resources": "node scripts/fetch-resources.js"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.deepseek.stabledsh",
+    "productName": "stableDSH",
+    "artifactName": "stableDSH-Setup-${version}.${ext}",
+    "electronDist": "node_modules/electron/dist",
+    "files": [
+      "main.js",
+      "assets/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "resources"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "shortcutName": "stableDSH",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
