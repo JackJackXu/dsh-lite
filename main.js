@@ -330,6 +330,39 @@ function showAbout() {
 }
 
 /* ---------------- window ---------------- */
+// Renderer crash self-recovery: exponential backoff reload, rebuild the
+// window after too many consecutive failures, auto-reload on hang.
+let crashCount = 0;
+const CRASH_LIMIT = 4;
+
+function setupCrashRecovery(win) {
+  win.webContents.on('render-process-gone', (_e, details) => {
+    log('renderer gone: ' + details.reason + ' (crash #' + (crashCount + 1) + ')');
+    crashCount += 1;
+    const delay = Math.min(1000 * Math.pow(2, crashCount - 1), 8000);
+    setTimeout(() => {
+      if (win.isDestroyed() || isQuitting) return;
+      if (crashCount >= CRASH_LIMIT) {
+        log('renderer crash limit reached — rebuilding window');
+        crashCount = 0;
+        win.destroy();
+        createWindow();
+      } else {
+        win.loadURL(dshUrl);
+      }
+    }, delay);
+  });
+  win.webContents.on('unresponsive', () => {
+    log('renderer unresponsive — scheduling reload');
+    setTimeout(() => {
+      if (win.isDestroyed() || isQuitting) return;
+      if (win.webContents.isCrashed && win.webContents.isCrashed()) return;
+      win.webContents.reload();
+    }, 5000);
+  });
+  win.webContents.on('responsive', () => { /* recovered */ });
+}
+
 function createWindow() {
   const iconPath = path.join(__dirname, 'assets', 'icon.png');
   mainWindow = new BrowserWindow({
@@ -345,6 +378,7 @@ function createWindow() {
   });
 
   mainWindow.loadURL(dshUrl);
+  setupCrashRecovery(mainWindow);
 
   mainWindow.on('close', e => {
     if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
