@@ -62,15 +62,18 @@ const PALETTE = { D: '#142660', B: '#4E6FFF', L: '#BEE1FF', W: '#FFFFFF' };
 const W = SPRITE[0].length;
 const H = SPRITE.length;
 
+// Defensive normalization: every row must be exactly W wide (pad/trim).
+const GRID = SPRITE.map(r => r.padEnd(W, '.').slice(0, W));
+
 function hexToRgb(hex) {
   return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
 }
 
-// RGBA raw buffer (40 x 24), transparent background
+// RGBA raw buffer (W x H), transparent background
 const raw = Buffer.alloc(W * H * 4);
 for (let y = 0; y < H; y++) {
   for (let x = 0; x < W; x++) {
-    const ch = SPRITE[y][x];
+    const ch = GRID[y][x];
     const o = (y * W + x) * 4;
     if (PALETTE[ch]) {
       const [r, g, b] = hexToRgb(PALETTE[ch]);
