@@ -288,6 +288,7 @@ function startMuxWatcher(wsUrl) {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  muxProc.stderr.on('data', buf => log('mux: ' + buf.toString().trim()));
   muxProc.stdout.on('data', buf => {
     for (const line of buf.toString().split('\n')) {
       if (!line.trim()) continue;

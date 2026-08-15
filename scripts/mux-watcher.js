@@ -25,16 +25,21 @@ if (!url) {
 let ws = null;
 let retryTimer = null;
 let closing = false;
+let failures = 0;
 
 function connect() {
   if (closing) return;
   try {
     ws = new WebSocket(url);
   } catch (e) {
+    process.stderr.write('mux connect threw: ' + e.message + '\n');
     scheduleReconnect();
     return;
   }
-  ws.onopen = () => { /* connected silently */ };
+  ws.onopen = () => {
+    failures = 0;
+    process.stderr.write('mux connected to ' + url + '\n');
+  };
   ws.onmessage = (ev) => {
     let frame;
     try { frame = JSON.parse(String(ev.data)); } catch { return; }
@@ -55,8 +60,16 @@ function connect() {
       }
     }
   };
-  ws.onclose = () => { ws = null; scheduleReconnect(); };
-  ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+  ws.onclose = (ev) => {
+    ws = null;
+    process.stderr.write('mux closed (code ' + ev.code + ' ' + ev.reason + ')\n');
+    scheduleReconnect();
+  };
+  ws.onerror = (ev) => {
+    failures += 1;
+    process.stderr.write('mux error (attempt ' + failures + '): ' + (ev && ev.message ? ev.message : String(ev)) + '\n');
+    try { ws.close(); } catch { /* ignore */ }
+  };
 }
 
 function scheduleReconnect() {
