@@ -18,7 +18,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
-const updater = require('./scripts/dsh-updater.js');
+const updater = require(path.join(scriptsDir(), 'dsh-updater.js'));
 
 const APP_NAME = 'stableDSH';
 // The service is started with --port 0 so the OS assigns a free port (never
@@ -60,6 +60,17 @@ function resDir() {
   const inApp = path.join(__dirname, 'resources');
   if (fs.existsSync(inApp)) return inApp;
   return path.join(path.dirname(__dirname), 'resources');
+}
+
+// Bundled scripts dir (dsh-updater.js, session-watcher.js, mux-watcher.js).
+// Packaged builds put them OUTSIDE app.asar via extraResources so the spawned
+// bundled node.exe can execute them as real files:
+//   dev:      <project>/scripts
+//   packaged: <installDir>/resources/scripts
+function scriptsDir() {
+  const inApp = path.join(__dirname, 'scripts');
+  if (fs.existsSync(inApp)) return inApp;
+  return path.join(path.dirname(__dirname), 'scripts');
 }
 
 let mainWindow = null;
@@ -265,7 +276,7 @@ function restartDsh() {
 //   {"event":"session",cwd}  -> remember the latest working directory
 function startSessionWatcher() {
   const nodeExe = findNodeExe();
-  const watcherJs = path.join(__dirname, 'scripts', 'session-watcher.js');
+  const watcherJs = path.join(scriptsDir(), 'session-watcher.js');
   if (!nodeExe || !fs.existsSync(watcherJs)) { log('session watcher unavailable'); return; }
   const sessionsDir = path.join(DATA_DIR, 'sessions');
   fs.mkdirSync(sessionsDir, { recursive: true });
@@ -346,7 +357,7 @@ function startMuxWatcher(wsUrl) {
     try { muxProc.kill(); } catch (e) { /* ignore */ }
   }
   const nodeExe = findNodeExe();
-  const muxJs = path.join(__dirname, 'scripts', 'mux-watcher.js');
+  const muxJs = path.join(scriptsDir(), 'mux-watcher.js');
   if (!nodeExe || !fs.existsSync(muxJs)) { log('mux watcher unavailable'); return; }
   muxProc = spawn(nodeExe, [muxJs, '--url', wsUrl], {
     cwd: DATA_DIR,
