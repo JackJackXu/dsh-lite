@@ -145,7 +145,7 @@ function startDsh() {
     if (m) {
       dshUrl = m[1];
       log('resolved dsh url: ' + dshUrl);
-      connectMux(); // approval/question notifications via SSE
+      startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
     }
   });
   dshProc.stderr.on('data', buf => dshWebLog(buf.toString()));
@@ -229,15 +229,16 @@ function startSessionWatcher() {
 }
 
 function notifyTurnEnd(msg) {
-  log('task finished: ' + (msg.title || '') + ' | ' + (msg.body || ''));
+  const body = msg.title ? '任务完成：「' + msg.title + '」' : '任务完成，点击查看详情';
+  log('task finished: ' + body);
   // Always notify: Windows toasts do not steal focus; the user asked to know
   // when a task finishes even with the window open.
   if (Notification.isSupported()) {
-    const n = new Notification({ title: msg.title || APP_NAME, body: msg.body || '' });
+    const n = new Notification({ title: APP_NAME, body });
     n.on('click', () => showWindow());
     n.show();
   } else if (tray) {
-    tray.displayBalloon({ title: msg.title || APP_NAME, content: msg.body || '' });
+    tray.displayBalloon({ title: APP_NAME, content: body });
   }
 }
 
@@ -254,85 +255,59 @@ function openTerminal() {
   });
 }
 
-/* ---------------- mux listener: approval & question notifications ---------------- */
-// The dsh web app streams every pending approval / user question over
-// GET /api/events.mux (SSE) — including a replay of still-pending entries on
-// connect. The shell connects as another client and turns those frames into
-// Windows notifications, independent of the web UI (works when minimized).
-let muxAbort = null;
+/* ---------------- mux watcher: approval & question notifications ---------------- */
+// The dsh web app exposes its mux stream over WebSocket (/api/events.mux);
+// every pending approval / user question arrives there (including a replay of
+// still-pending entries on connect). A standalone node process (bundled node
+// has global WebSocket; the Electron main process node does not) connects and
+// reports attention events over stdout:
+//   {"event":"attention","kind":"approval"|"question",...}
+let muxProc = null;
 
-function notifyAttention(title, body) {
-  log('attention: ' + title + ' | ' + body);
+function notifyAttention(body) {
+  log('attention: ' + body);
   if (Notification.isSupported()) {
-    const n = new Notification({ title: title || APP_NAME, body: body || '' });
+    const n = new Notification({ title: APP_NAME, body: body || '' });
     n.on('click', () => showWindow());
     n.show();
   } else if (tray) {
-    tray.displayBalloon({ title: title || APP_NAME, content: body || '' });
+    tray.displayBalloon({ title: APP_NAME, content: body || '' });
   }
 }
 
-// One SSE event: accumulate data lines until a blank line, then hand the JSON
-// payload to onFrame. Returns leftover buffer (handles frames split across chunks).
-function feedSse(buf, text, onFrame) {
-  buf += text;
-  let idx;
-  while ((idx = buf.indexOf('\n\n')) >= 0) {
-    const block = buf.slice(0, idx);
-    buf = buf.slice(idx + 2);
-    let data = '';
-    for (const line of block.split('\n')) {
-      if (line.startsWith('data:')) data += line.slice(5).trimStart();
-    }
-    if (!data) continue;
-    try { onFrame(JSON.parse(data)); } catch { /* malformed frame */ }
+function startMuxWatcher(wsUrl) {
+  if (muxProc && !muxProc.killed) {
+    try { muxProc.kill(); } catch (e) { /* ignore */ }
   }
-  return buf;
-}
-
-async function connectMux() {
-  if (muxAbort) { muxAbort.abort(); muxAbort = null; }
-  const ctrl = new AbortController();
-  muxAbort = ctrl;
-  let buf = '';
-  for (;;) {
-    if (isQuitting) return;
-    try {
-      const res = await fetch(dshUrl + '/api/events.mux', { signal: ctrl.signal });
-      if (!res.ok || !res.body) throw new Error('mux HTTP ' + res.status);
-      log('mux connected: ' + dshUrl);
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf = feedSse(buf, dec.decode(value, { stream: true }), onMuxFrame);
-      }
-      log('mux stream closed');
-    } catch (e) {
-      if (ctrl.signal.aborted || isQuitting) return;
-      log('mux connect failed: ' + e.message + ' (retrying)');
-    }
-    // Reconnect with backoff; also picks up a new port after service restart.
-    await new Promise(r => setTimeout(r, 4000));
-  }
-}
-
-function onMuxFrame(frame) {
-  try {
-    if (frame && typeof frame.type === 'string') {
-      if (frame.type === 'approval/requested') {
-        const tool = frame.toolName || 'tool';
-        notifyAttention('Approval needed: ' + tool, (frame.reason || 'An agent action needs your approval. Click to review.') + ' (session ' + String(frame.sessionId).slice(-8) + ')');
-      } else if (frame.type === 'question/requested') {
-        for (const q of frame.questions || []) {
-          const head = q.header || '';
-          const text = q.question || 'A question needs your answer.';
-          notifyAttention(head ? 'Question: ' + head : 'Question needs your answer', text);
+  const nodeExe = findNodeExe();
+  const muxJs = path.join(__dirname, 'scripts', 'mux-watcher.js');
+  if (!nodeExe || !fs.existsSync(muxJs)) { log('mux watcher unavailable'); return; }
+  muxProc = spawn(nodeExe, [muxJs, '--url', wsUrl], {
+    cwd: DATA_DIR,
+    env: Object.assign({}, process.env),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  muxProc.stdout.on('data', buf => {
+    for (const line of buf.toString().split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.event !== 'attention') continue;
+        if (msg.kind === 'approval') {
+          const reason = msg.reason ? '（' + msg.reason + '）' : '';
+          notifyAttention('需要你的审批：' + msg.toolName + reason);
+        } else if (msg.kind === 'question') {
+          const head = msg.header ? '「' + msg.header + '」' : '';
+          notifyAttention('需要你回答' + head + '：' + (msg.question || '有一个问题等待你回答'));
         }
-      }
+      } catch { /* partial line */ }
     }
-  } catch (e) { log('mux frame error: ' + e.message); }
+  });
+  muxProc.on('exit', code => {
+    muxProc = null;
+    if (!isQuitting) log('mux watcher exited, code=' + code);
+  });
 }
 
 /* ---------------- dsh kernel updates (overlay) ---------------- */
@@ -495,6 +470,9 @@ function quitApp() {
   stopDsh();
   if (watcherProc && !watcherProc.killed) {
     try { watcherProc.kill(); } catch (e) { /* ignore */ }
+  }
+  if (muxProc && !muxProc.killed) {
+    try { muxProc.kill(); } catch (e) { /* ignore */ }
   }
   app.quit();
 }
