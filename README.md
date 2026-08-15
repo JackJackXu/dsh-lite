@@ -1,4 +1,4 @@
-﻿# 🐋 stableDSH
+# 🐋 stableDSH
 
 DeepSeek Harness (DSH) 的自包含桌面版：**本地服务 + Electron 窗口 + QQ 式托盘**，
 **数据与开发环境完全隔离**，适合日常使用。
@@ -52,7 +52,7 @@ node scripts\fetch-resources.js
 # 2) 打包（管理员权限执行，winCodeSign 需要）
 $env:ELECTRON_BUILDER_BINARIES_MIRROR="https://npmmirror.com/mirrors/electron-builder-binaries/"
 npx electron-builder --win
-# 产物: release\stableDSH-Setup-0.1.0.exe
+# 产物: release\stableDSH-Setup-1.0.0.exe
 ```
 
 > 只想小体积、目标机器已有 node+dsh 时，可跳过第 1 步直接打包（系统回退模式）。
