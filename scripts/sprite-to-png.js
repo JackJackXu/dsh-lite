@@ -31,12 +31,18 @@ const SPRITE = [
   'KBBBBBBBBKKBBBBK',
   'KBKBBBKBBBBBBBBK',
   'KBKBBBKBBBBBBBBK',
-  'KBBBBBBBBBBBBBK.',
+  'KBBBBBBBBBBBBBBK',
   'KB.....BBBBKBBK.',
   'KL......LKBBKBK.',
   '.KLLLLLLLKKBBK..',
   '..KKKKKKK..KK...',
 ]
+
+// Every row must be exactly 16 cells; a stray character here silently shifts
+// every following row. Fail loud instead.
+for (const row of SPRITE) {
+  if (row.length !== 16) throw new Error('sprite row length ' + row.length + ' != 16: "' + row + '"')
+}
 
 const PALETTE = {
   K: [0, 0, 0],
