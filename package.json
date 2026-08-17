@@ -29,8 +29,12 @@
     ],
     "extraResources": [
       {
-        "from": "scripts",
-        "to": "scripts"
+        "from": "scripts/session-watcher.js",
+        "to": "scripts/session-watcher.js"
+      },
+      {
+        "from": "scripts/mux-watcher.js",
+        "to": "scripts/mux-watcher.js"
       }
     ],
     "directories": {
@@ -49,8 +53,5 @@
       "shortcutName": "DSH DLE",
       "deleteAppDataOnUninstall": false
     }
-  },
-  "allowScripts": {
-    "electron@31.7.7": true
   }
 }

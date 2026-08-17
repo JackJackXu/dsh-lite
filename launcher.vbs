@@ -1,5 +1,7 @@
 ' DSH DLE launcher - hidden, no console (ASCII only)
-Dim shell, appPath
+' Resolves its own directory so the file works from any checkout location.
+Dim shell, appDir, fso
+Set fso = CreateObject("Scripting.FileSystemObject")
+appDir = fso.GetParentFolderName(WScript.ScriptFullName)
 Set shell = CreateObject("WScript.Shell")
-appPath = "C:\MyMy\my_work\dsh_default\dsh-dle"
-shell.Run """" & appPath & "\node_modules\electron\dist\electron.exe"" """ & appPath & """", 0, False
+shell.Run """" & appDir & "\node_modules\electron\dist\electron.exe"" """ & appDir & """", 0, False

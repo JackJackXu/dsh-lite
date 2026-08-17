@@ -52,11 +52,12 @@ npx electron-builder --win
 DSH DLE/
 ├── main.js                  # 主进程（窗口 + 托盘 + 服务管理 + 单实例 + watcher）
 ├── package.json             # 项目定义 + electron-builder 配置
-├── scripts/
+├── LICENSE                  # MIT
+├── scripts/                 # 运行时 watcher（随安装包发布）
 │   ├── session-watcher.js   # 任务完成通知（读会话日志）
-│   ├── mux-watcher.js       # 审批/选择题通知（连 mux 流）
-│   ├── generate-whale-icon.js # 生成像素鲸鱼图标（sharp）
-│   └── make-icon-from-png.js # 从用户像素画生成图标
+│   └── mux-watcher.js       # 审批/选择题通知（连 mux 流）
+│   ├── generate-whale-icon.js # 开发用：生成像素鲸鱼图标（不进安装包）
+│   └── make-icon-from-png.js   # 开发用：从用户像素画生成图标（不进安装包）
 ├── start-dsh.bat            # 备用启动器（无黑框，调 launcher.vbs）
 ├── launcher.vbs             # 静默启动 electron（ASCII，无编码坑）
 ├── assets/

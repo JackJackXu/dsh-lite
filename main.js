@@ -79,6 +79,9 @@ let lastCwd = null;
 let muxProc = null;
 let isQuitting = false;
 let isRestarting = false;
+// Live Notification handles: kept referenced so the OS never GCs a toast
+// before it shows (see showNotification).
+let notifications = [];
 
 /* ---------------- logging ---------------- */
 function log(msg) {
@@ -115,17 +118,23 @@ function findDshEntry() {
 
 /* ---------------- DSH service probe (health check) ---------------- */
 function probeDsh(cb) {
+  let done = false;
+  const once = result => {
+    if (done) return;
+    done = true;
+    cb(result);
+  };
   const req = http.get(dshUrl, res => {
     let body = '';
     res.on('data', c => {
       body += c;
       if (body.length > 2000) req.destroy();
     });
-    res.on('end', () => cb(res.statusCode === 200 && (body.includes('id="root"') || body.includes('DeepSeek Harness'))));
-    res.on('error', () => cb(false));
+    res.on('end', () => once(res.statusCode === 200 && (body.includes('id="root"') || body.includes('DeepSeek Harness'))));
+    res.on('error', () => once(false));
   });
-  req.on('error', () => cb(false));
-  req.setTimeout(1500, () => { req.destroy(); cb(false); });
+  req.on('error', () => once(false));
+  req.setTimeout(1500, () => { req.destroy(); once(false); });
 }
 
 function waitForDsh(cb) {
@@ -204,13 +213,14 @@ function startDsh(portArg) {
   // sessions, plugins, skins). The spawned process inherits the user's PATH.
   fs.mkdirSync(DATA_DIR, { recursive: true });
   // Capture stdout to parse the announced port and to persist dsh-web.log.
-  dshProc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
+  const proc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
     cwd: DATA_DIR,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  dshProc.stdout.on('data', buf => {
+  dshProc = proc;
+  proc.stdout.on('data', buf => {
     const text = buf.toString();
     dshWebLog(text);
     const m = /dsh web: (https?:\/\/127\.0\.0\.1:\d+)/.exec(text);
@@ -224,10 +234,13 @@ function startDsh(portArg) {
       startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
     }
   });
-  dshProc.stderr.on('data', buf => dshWebLog(buf.toString()));
-  dshProc.on('exit', code => {
+  proc.stderr.on('data', buf => dshWebLog(buf.toString()));
+  proc.on('exit', code => {
+    // Stale-exit guard: a restart kills the old process and spawns a new one;
+    // the old process's async exit event must not null out the CURRENT
+    // reference (or the new process would escape quitApp's tree kill).
+    if (dshProc === proc) dshProc = null;
     log('dsh service exited, code=' + code);
-    dshProc = null;
     if (!isQuitting && !isRestarting && tray) {
       tray.displayBalloon({
         title: APP_NAME,
@@ -235,7 +248,7 @@ function startDsh(portArg) {
       });
     }
   });
-  return dshProc;
+  return proc;
 }
 
 // Kill the whole process tree: dsh spawns pwsh/agent children that would
@@ -321,8 +334,15 @@ function showNotification(title, body) {
   }
   log('notify: ' + body);
   if (Notification.isSupported()) {
+    // Keep a reference until close: an unreferenced Notification can be GC'd
+    // on some platforms before it is shown.
     const n = new Notification({ title, body });
     n.on('click', () => showWindow());
+    n.on('close', () => {
+      const i = notifications.indexOf(n);
+      if (i >= 0) notifications.splice(i, 1);
+    });
+    notifications.push(n);
     n.show();
   } else if (tray) {
     tray.displayBalloon({ title, content: body });
@@ -356,14 +376,15 @@ function startMuxWatcher(wsUrl) {
   const nodeExe = findNodeExe();
   const muxJs = path.join(scriptsDir(), 'mux-watcher.js');
   if (!nodeExe || !fs.existsSync(muxJs)) { log('mux watcher unavailable'); return; }
-  muxProc = spawn(nodeExe, [muxJs, '--url', wsUrl], {
+  const proc = spawn(nodeExe, [muxJs, '--url', wsUrl], {
     cwd: DATA_DIR,
     env: Object.assign({}, process.env),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  muxProc.stderr.on('data', buf => log('mux: ' + buf.toString().trim()));
-  muxProc.stdout.on('data', buf => {
+  muxProc = proc;
+  proc.stderr.on('data', buf => log('mux: ' + buf.toString().trim()));
+  proc.stdout.on('data', buf => {
     for (const line of buf.toString().split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -379,8 +400,10 @@ function startMuxWatcher(wsUrl) {
       } catch { /* partial line */ }
     }
   });
-  muxProc.on('exit', code => {
-    muxProc = null;
+  proc.on('exit', code => {
+    // Stale-exit guard, same race as startDsh: a restart replaces muxProc
+    // before the old process's exit event arrives.
+    if (muxProc === proc) muxProc = null;
     if (!isQuitting) log('mux watcher exited, code=' + code);
   });
 }
