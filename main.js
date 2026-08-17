@@ -309,10 +309,16 @@ function startSessionWatcher() {
 }
 
 // One notification path for every event (task finished / approval / question).
-// Windows toasts do not steal focus; the user asked to know even with the
-// window open. Falls back to a tray balloon when toasts are unsupported.
+// Windows toasts do not steal focus; falls back to a tray balloon when toasts
+// are unsupported. Only notify when the user is NOT actively watching the
+// window: minimized, hidden to tray, or unfocused. When the window is front
+// and focused the page itself shows the result — a toast would just be noise.
 function showNotification(title, body) {
   if (!notificationsEnabled) return;
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && mainWindow.isFocused()) {
+    log('notify suppressed (window focused): ' + body);
+    return;
+  }
   log('notify: ' + body);
   if (Notification.isSupported()) {
     const n = new Notification({ title, body });
