@@ -1,25 +1,23 @@
 {
-  "name": "stabledsh",
+  "name": "dsh-lite",
   "version": "1.0.0",
-  "description": "stableDSH - self-contained DeepSeek Harness desktop app (tray + auto service + isolated data)",
+  "description": "DSH Lite — DeepSeek Harness Desktop Lite Edition: thin Electron shell (tray + notifications + security) sharing the dev ~/.dsh profile",
   "main": "main.js",
-  "author": "stableDSH",
+  "author": "DSH Lite",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win",
-    "fetch-resources": "node scripts/fetch-resources.js"
+    "dist": "electron-builder --win"
   },
   "devDependencies": {
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.deepseek.stabledsh",
-    "productName": "stableDSH",
-    "artifactName": "stableDSH-Setup-${version}.${ext}",
+    "appId": "com.deepseek.dshlite",
+    "productName": "DSH Lite",
+    "artifactName": "DSH-Lite-Setup-${version}.${ext}",
     "electronDist": "node_modules/electron/dist",
-    "afterPack": "scripts/after-pack.js",
     "electronLanguages": [
       "en-US",
       "zh-CN"
@@ -30,10 +28,6 @@
       "package.json"
     ],
     "extraResources": [
-      {
-        "from": "resources",
-        "to": "resources"
-      },
       {
         "from": "scripts",
         "to": "scripts"
@@ -52,7 +46,7 @@
       "oneClick": true,
       "perMachine": false,
       "createDesktopShortcut": true,
-      "shortcutName": "stableDSH",
+      "shortcutName": "DSH Lite",
       "deleteAppDataOnUninstall": false
     }
   }

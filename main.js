@@ -1,11 +1,11 @@
 /**
- * main.js — stableDSH (DeepSeek Harness desktop wrapper)
+ * main.js — DSH Lite (DeepSeek Harness Desktop Lite Edition)
  *
  * Design:
- *  - Self-contained: prefers bundled resources (resources/node, resources/dsh),
- *    falls back to the system node/dsh when not bundled (dev mode).
- *  - Isolated data: DSH_HOME = %LOCALAPPDATA%\stableDSH (independent config,
- *    sessions, plugins — never touches the user's ~/.dsh).
+ *  - Thin Electron shell: uses the SYSTEM node + dsh (the same environment as
+ *    the dev web profile) — no bundled runtime, no update overlay.
+ *  - Shared data: DSH_HOME is NOT overridden, so the app shares ~/.dsh with
+ *    the dev profile (same API key, sessions, plugins, skins).
  *  - Port: last-used port is reused when free (stable web origin), otherwise
  *    the OS assigns a free one (parsed from stdout).
  *  - Single instance: a second launch focuses the existing window.
@@ -18,9 +18,9 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
-const updater = require(path.join(scriptsDir(), 'dsh-updater.js'));
 
-const APP_NAME = 'stableDSH';
+// Product name shown in tray/window/about. Full name lives in package.json.
+const APP_NAME = 'DSH Lite';
 // The service is started with --port 0 so the OS assigns a free port (never
 // conflicts). The real URL is parsed from dsh's stdout line:
 //   "dsh web: http://127.0.0.1:<port>"
@@ -30,8 +30,9 @@ let dshUrl = 'http://127.0.0.1:' + FALLBACK_PORT;
 const POLL_INTERVAL = 800;
 const POLL_TIMEOUT = 40000;
 
-// Isolated data directory (DSH_HOME). Never touches ~/.dsh.
-const DATA_DIR = process.env.STABLEDSH_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', APP_NAME);
+// Shell state dir (logs, port persistence, settings). NOT used as DSH_HOME:
+// the app deliberately shares ~/.dsh with the dev web profile.
+const DATA_DIR = process.env.STABLEDSH_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH Lite');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'stableDSH.log');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
@@ -52,19 +53,9 @@ function saveSettings() {
   } catch { /* ignore */ }
 }
 
-// Bundled runtime dir (resources/). Packaged builds put it OUTSIDE app.asar via
-// extraResources so the spawned system node.exe can run real files:
-//   dev:      <project>/resources
-//   packaged: <installDir>/resources/resources   (__dirname = .../resources/app.asar)
-function resDir() {
-  const inApp = path.join(__dirname, 'resources');
-  if (fs.existsSync(inApp)) return inApp;
-  return path.join(path.dirname(__dirname), 'resources');
-}
-
-// Bundled scripts dir (dsh-updater.js, session-watcher.js, mux-watcher.js).
+// Bundled scripts dir (session-watcher.js, mux-watcher.js).
 // Packaged builds put them OUTSIDE app.asar via extraResources so the spawned
-// bundled node.exe can execute them as real files:
+// system node.exe can execute them as real files:
 //   dev:      <project>/scripts
 //   packaged: <installDir>/resources/scripts
 function scriptsDir() {
@@ -92,10 +83,10 @@ function log(msg) {
   } catch { /* log dir unavailable */ }
 }
 
-/* ---------------- bundled vs system environment ---------------- */
+/* ---------------- system environment lookup ---------------- */
+// DSH Lite uses the system Node.js and dsh installation (the same environment
+// the dev web profile runs on), so data/plugins/skins are shared automatically.
 function findNodeExe() {
-  const builtin = path.join(resDir(), 'node', 'node.exe');
-  if (fs.existsSync(builtin)) return builtin;
   const candidates = [
     path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'nodejs', 'node.exe'),
     path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'nodejs', 'node.exe'),
@@ -105,11 +96,6 @@ function findNodeExe() {
 }
 
 function findDshEntry() {
-  // Update overlay first (dsh kernel updates install here), then bundled, then system.
-  const overlay = path.join(DATA_DIR, 'agent', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  if (fs.existsSync(overlay)) return overlay;
-  const builtin = path.join(resDir(), 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  if (fs.existsSync(builtin)) return builtin;
   const candidates = [
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
     path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'bin.js'),
@@ -187,21 +173,14 @@ async function resolvePortArg() {
 
 function startDsh(portArg) {
   const entry = findDshEntry();
-  if (!entry) { log('dsh entry not found (bundled or system)'); return null; }
+  if (!entry) { log('dsh entry not found (system)'); return null; }
   const nodeExe = findNodeExe();
   if (!nodeExe) { log('node.exe not found'); return null; }
-  const mode = entry.includes(resDir()) ? 'bundled' : 'system';
-  log('starting dsh web via ' + mode + ' node: ' + nodeExe + ' (--port ' + portArg + ')');
+  log('starting dsh web via system node: ' + nodeExe + ' (--port ' + portArg + ')');
   const env = Object.assign({}, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
-  env.DSH_HOME = DATA_DIR;   // isolated data directory
-  // Make the bundled node available to the agent: append (never prepend) the
-  // bundled node dir to PATH, so a machine without Node still lets the agent
-  // run `node`/`npm`, while a machine with its own Node keeps using it.
-  const bundledNodeDir = path.join(resDir(), 'node');
-  if (fs.existsSync(path.join(bundledNodeDir, 'node.exe')) && !(env.PATH || '').split(path.delimiter).includes(bundledNodeDir)) {
-    env.PATH = env.PATH ? env.PATH + path.delimiter + bundledNodeDir : bundledNodeDir;
-  }
+  // No DSH_HOME override: share ~/.dsh with the dev web profile (API key,
+  // sessions, plugins, skins). The spawned process inherits the user's PATH.
   fs.mkdirSync(DATA_DIR, { recursive: true });
   // Capture stdout to parse the announced port and to persist dsh-web.log.
   dshProc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
@@ -278,7 +257,9 @@ function startSessionWatcher() {
   const nodeExe = findNodeExe();
   const watcherJs = path.join(scriptsDir(), 'session-watcher.js');
   if (!nodeExe || !fs.existsSync(watcherJs)) { log('session watcher unavailable'); return; }
-  const sessionsDir = path.join(DATA_DIR, 'sessions');
+  // Sessions live in the shared DSH home (~/.dsh), same as the dev web profile.
+  const dshHome = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
+  const sessionsDir = path.join(dshHome, 'sessions');
   fs.mkdirSync(sessionsDir, { recursive: true });
   watcherProc = spawn(nodeExe, [watcherJs, '--sessions', sessionsDir], {
     cwd: DATA_DIR,
@@ -388,83 +369,19 @@ function startMuxWatcher(wsUrl) {
   });
 }
 
-/* ---------------- dsh kernel updates (overlay) ---------------- */
-function currentDshVersion() {
-  const entry = findDshEntry();
-  return entry ? updater.installedVersion(entry) : null;
-}
-
-// Check for a newer @deepseek-ai/dsh on npm. silent: only report problems when
-// the user asked manually. Returns after prompting/installing.
-async function checkDshUpdates(silent) {
-  const latest = await updater.fetchLatestVersion();
-  if (!latest) {
-    if (!silent) dialog.showMessageBox(mainWindow, { type: 'warning', title: 'Check Updates', message: 'Could not reach npm registry.' });
-    return;
-  }
-  const current = currentDshVersion();
-  if (current && updater.compareVersions(latest.version, current) <= 0) {
-    if (!silent) dialog.showMessageBox(mainWindow, { type: 'info', title: 'Check Updates', message: APP_NAME + ' is up to date (dsh ' + current + ').' });
-    return;
-  }
-  const r = await dialog.showMessageBox(mainWindow, {
-    type: 'info',
-    title: 'dsh Update Available',
-    message: 'New dsh version: ' + latest.version + (current ? ' (current ' + current + ')' : ''),
-    detail: 'Install now? The update is installed into your data directory and the old version is kept as a fallback.',
-    buttons: ['Update Now', 'Later'],
-    defaultId: 0,
-    cancelId: 1,
-  });
-  if (r.response === 0) await runDshUpdate(latest);
-}
-
-async function runDshUpdate(latest) {
-  const nodeExe = findNodeExe();
-  const npmCli = path.join(resDir(), 'node', 'node_modules', 'npm', 'bin', 'npm-cli.js');
-  if (!nodeExe || !fs.existsSync(npmCli)) {
-    dialog.showMessageBox(mainWindow, { type: 'error', title: 'Update Failed', message: 'Bundled npm not found.' });
-    return;
-  }
-  const stagingDir = path.join(DATA_DIR, 'agent-staging');
-  const agentDir = path.join(DATA_DIR, 'agent');
-  log('dsh update: installing ' + latest.version + ' to staging...');
-  const installed = await new Promise(resolve => {
-    updater.installToStaging({ nodeExe, npmCli, version: latest.version, registry: latest.registry, stagingDir, onExit: resolve });
-  });
-  if (!installed) {
-    log('dsh update: install failed (old version kept)');
-    dialog.showMessageBox(mainWindow, { type: 'error', title: 'Update Failed', message: 'Install failed. The previous version is kept.' });
-    return;
-  }
-  if (!updater.commitOverlay(stagingDir, agentDir)) {
-    log('dsh update: commit failed (rolled back)');
-    dialog.showMessageBox(mainWindow, { type: 'error', title: 'Update Failed', message: 'Could not activate the update. Rolled back to the previous version.' });
-    return;
-  }
-  log('dsh update: activated ' + latest.version + ' (overlay)');
-  const rr = await dialog.showMessageBox(mainWindow, {
-    type: 'info',
-    title: 'Update Ready',
-    message: 'dsh ' + latest.version + ' installed.',
-    detail: 'Restart the DSH service to use it.',
-    buttons: ['Restart Now', 'Later'],
-    defaultId: 0,
-    cancelId: 1,
-  });
-  if (rr.response === 0) restartDsh();
-}
-
 /* ---------------- paths ---------------- */
 function openDataDir() { fs.mkdirSync(DATA_DIR, { recursive: true }); shell.openPath(DATA_DIR); }
 function openLogDir() { fs.mkdirSync(LOG_DIR, { recursive: true }); shell.openPath(LOG_DIR); }
 function openPluginDir() {
+  // Shared with the dev web profile: the plugin home is ~/.dsh\profiles\web.
+  const home = process.env.USERPROFILE || process.env.HOME || '.';
   const candidates = [
-    path.join(DATA_DIR, 'profiles', 'web', 'node_modules'),
-    path.join(DATA_DIR, 'profiles', 'node_modules'),
+    path.join(home, '.dsh', 'profiles', 'web', 'node_modules'),
+    path.join(home, '.dsh', 'profiles', 'node_modules'),
+    path.join(home, '.dsh'),
   ];
   for (const c of candidates) if (fs.existsSync(c)) return shell.openPath(c);
-  shell.openPath(DATA_DIR);
+  shell.openPath(path.join(home, '.dsh'));
 }
 
 /* ---------------- tray ---------------- */
@@ -494,7 +411,6 @@ function buildTrayMenu() {
         log('notifications ' + (notificationsEnabled ? 'enabled' : 'disabled'));
       },
     },
-    { label: 'Check for dsh Updates', click: () => checkDshUpdates(false) },
     { label: 'Open Terminal (session dir)', click: openTerminal },
     { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
     { label: 'Restart DSH Service', click: restartDsh },
@@ -519,10 +435,11 @@ function showAbout() {
     type: 'info',
     title: 'About ' + APP_NAME,
     message: APP_NAME + ' ' + pkg.version,
-    detail: 'DeepSeek Harness desktop wrapper (self-contained)\n\n' +
-      'Data: ' + DATA_DIR + '\n' +
+    detail: 'DeepSeek Harness Desktop Lite Edition (thin Electron shell)\n\n' +
+      'Shell data: ' + DATA_DIR + '\n' +
+      'DSH home (shared with dev web profile): ' + path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh') + '\n' +
       'URL: ' + dshUrl + '\n' +
-      'Mode: ' + (findDshEntry()?.includes(resDir()) ? 'bundled' : 'system') + '\n\n' +
+      'Runtime: system node + dsh (no bundled runtime)\n\n' +
       'Notifications (task finished / approval / question) via built-in watchers.',
   });
 }
@@ -667,8 +584,6 @@ if (!gotLock) {
     installSecurityHooks();
     installWakeRecovery();
     startSessionWatcher();
-    // Auto-check for dsh kernel updates shortly after boot (silent; prompts only when newer).
-    setTimeout(() => { checkDshUpdates(true); }, 15000);
     probeDsh(async ok => {
       if (!ok) {
         const portArg = await resolvePortArg();

@@ -5,9 +5,6 @@ release/
 dist/
 out/
 
-# --- 内置运行时（fetch-resources.js 可重新生成，281MB+ 不入库） ---
-resources/
-
 # --- 日志与临时文件 ---
 *.log
 .DS_Store
