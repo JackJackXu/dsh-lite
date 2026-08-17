@@ -19,7 +19,10 @@ const fs = require('fs');
 const http = require('http');
 const net = require('net');
 
-// Product name shown in tray/window/about. Full name lives in package.json.
+// Full product name (window title, tray tooltip, About). The short name is
+// used where space is tight (notifications, log lines).
+const PRODUCT_NAME = 'DeepSeek Harness Desktop - Lite Edition';
+// Short name shown in notifications and logs; window/tray/about use the full name.
 const APP_NAME = 'DSH Lite';
 // The service is started with --port 0 so the OS assigns a free port (never
 // conflicts). The real URL is parsed from dsh's stdout line:
@@ -426,7 +429,7 @@ function buildTrayMenu() {
 function createTray() {
   const img = loadTrayIcon();
   tray = new Tray(img || nativeImage.createEmpty());
-  tray.setToolTip(APP_NAME);
+  tray.setToolTip(PRODUCT_NAME);
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => showWindow());
 }
@@ -435,8 +438,8 @@ function showAbout() {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
   dialog.showMessageBox(mainWindow, {
     type: 'info',
-    title: 'About ' + APP_NAME,
-    message: APP_NAME + ' ' + pkg.version,
+    title: 'About ' + PRODUCT_NAME,
+    message: PRODUCT_NAME + '\nv' + pkg.version,
     detail: 'DeepSeek Harness Desktop Lite Edition (thin Electron shell)\n\n' +
       'Shell data: ' + DATA_DIR + '\n' +
       'DSH home (shared with dev web profile): ' + DSH_HOME + '\n' +
@@ -507,7 +510,7 @@ function createWindow() {
     height: 840,
     minWidth: 900,
     minHeight: 600,
-    title: APP_NAME,
+    title: PRODUCT_NAME,
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
     autoHideMenuBar: true,
     backgroundColor: '#1a1a1a',
@@ -526,6 +529,9 @@ function createWindow() {
     if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
+  // Keep the window title stable: dsh pages rewrite document.title on load,
+  // which would overwrite the product name in the title bar.
+  mainWindow.on('page-title-updated', e => e.preventDefault());
 }
 
 function showWindow() {
