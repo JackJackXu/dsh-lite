@@ -1,4 +1,4 @@
-' stableDSH launcher - hidden, no console (ASCII only)
+' DSH Lite launcher - hidden, no console (ASCII only)
 Dim shell, appPath
 Set shell = CreateObject("WScript.Shell")
 appPath = "C:\MyMy\my_work\dsh_default\stableDSH"

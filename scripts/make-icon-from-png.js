@@ -1,6 +1,6 @@
 'use strict';
 
-// Generate stableDSH icons from a user-drawn 32x32 pixel-art PNG.
+// Generate DSH Lite icons from a user-drawn 32x32 pixel-art PNG.
 //
 // The source is a 640x640 PNG = 32x32 grid scaled 20x. This script:
 //   1. downsamples to a 32x32 grid (majority color per cell),

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-// stableDSH mux watcher — standalone node process (Node >= 22 has global
-// WebSocket; the bundled node.exe is v24).
+// DSH Lite mux watcher — standalone node process (Node >= 22 has global
+// WebSocket; the system node is v24).
 //
 // Connects to the dsh web app's mux stream (WebSocket upgrade on
 // /api/events.mux) and prints one JSON line per pending human-interaction

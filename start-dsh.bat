@@ -1,4 +1,4 @@
 @echo off
-rem stableDSH launcher (ASCII only)
+rem DSH Lite launcher (ASCII only)
 start "" wscript.exe "%~dp0launcher.vbs"
 exit

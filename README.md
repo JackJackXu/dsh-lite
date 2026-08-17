@@ -59,7 +59,6 @@ DSH Lite/
 │   └── make-icon-from-png.js # 从用户像素画生成图标
 ├── start-dsh.bat            # 备用启动器（无黑框，调 launcher.vbs）
 ├── launcher.vbs             # 静默启动 electron（ASCII，无编码坑）
-├── create-shortcut.vbs      # 生成桌面快捷方式（可选）
 ├── assets/
 │   ├── icon.ico             # 打包用图标（鲸鱼）
 │   ├── icon.png             # 托盘/窗口图标

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-// stableDSH session watcher — standalone node process (must run on Node >= 22
-// which has node:zlib zstd support; the bundled node.exe is v24).
+// DSH Lite session watcher — standalone node process (must run on Node >= 22
+// which has node:zlib zstd support; the system node is v24).
 //
 // Watches dsh session logs (<sessionsDir>/**/session.jsonl.zstd) and prints one
 // JSON line per completed top-level agent turn:

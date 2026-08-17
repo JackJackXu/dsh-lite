@@ -49,5 +49,8 @@
       "shortcutName": "DSH Lite",
       "deleteAppDataOnUninstall": false
     }
+  },
+  "allowScripts": {
+    "electron@31.7.7": true
   }
 }

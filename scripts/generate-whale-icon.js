@@ -1,13 +1,13 @@
 'use strict';
 
-// Generate the stableDSH app icons from the pixel whale sprite
+// Generate the DSH Lite app icons from the pixel whale sprite
 // (mist-blue palette, from the dsh-terminal-skin plugin).
 // Outputs:
 //   assets/icon.ico        — multi-size ICO (16/32/48/64/128/256), packaged icon
 //   assets/icon.png        — 256px PNG (window/tray icon)
 //   assets/whale-pixel.png — 256px PNG source
 //
-// Run with a Node that can load sharp (the bundled dsh tree ships sharp).
+// Run with a Node that can load sharp.
 // Usage: node scripts/generate-whale-icon.js
 
 const path = require('node:path');

@@ -10,7 +10,7 @@
  *    the OS assigns a free one (parsed from stdout).
  *  - Single instance: a second launch focuses the existing window.
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
- *  - Logs to <dataDir>\logs\stableDSH.log for plugin/service debugging.
+ *  - Logs to <dataDir>\logs\dsh-lite.log for plugin/service debugging.
  */
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor } = require('electron');
 const { spawn } = require('child_process');
@@ -34,7 +34,7 @@ const POLL_TIMEOUT = 40000;
 // the app deliberately shares ~/.dsh with the dev web profile.
 const DATA_DIR = process.env.STABLEDSH_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH Lite');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'stableDSH.log');
+const LOG_FILE = path.join(LOG_DIR, 'dsh-lite.log');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 // User settings (persisted). Only notifications toggle for now.
@@ -92,6 +92,12 @@ function findNodeExe() {
     path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'nodejs', 'node.exe'),
   ];
   for (const c of candidates) if (fs.existsSync(c)) return c;
+  // Fallback: search PATH for node.exe (nvm/scoop/chocolatey installs).
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const c = path.join(dir, 'node.exe');
+    if (fs.existsSync(c)) return c;
+  }
   return null;
 }
 
@@ -249,7 +255,7 @@ function restartDsh() {
 }
 
 /* ---------------- session watcher (notifications + terminal dir) ---------------- */
-// Runs as a standalone node process (bundled node has zstd support; the
+// Runs as a standalone node process (the system node has zstd support; the
 // Electron main process node does not). Prints JSON lines:
 //   {"event":"turnEnd",...}  -> Windows notification
 //   {"event":"session",cwd}  -> remember the latest working directory
@@ -304,7 +310,8 @@ function notifyTurnEnd(msg) {
 // Open Windows Terminal (or PowerShell fallback) in the latest session's
 // working directory — modern look, not classic cmd.
 function openTerminal() {
-  const dir = lastCwd || DATA_DIR;
+  const dshHome = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
+  const dir = lastCwd || dshHome;
   const wt = spawn('wt.exe', ['-d', dir], { windowsHide: true, stdio: 'ignore' });
   wt.on('error', () => {
     // wt.exe missing -> PowerShell window fallback
@@ -317,9 +324,9 @@ function openTerminal() {
 /* ---------------- mux watcher: approval & question notifications ---------------- */
 // The dsh web app exposes its mux stream over WebSocket (/api/events.mux);
 // every pending approval / user question arrives there (including a replay of
-// still-pending entries on connect). A standalone node process (bundled node
-// has global WebSocket; the Electron main process node does not) connects and
-// reports attention events over stdout:
+// still-pending entries on connect). A standalone node process (the system
+// node has global WebSocket; the Electron main process node does not) connects
+// and reports attention events over stdout:
 //   {"event":"attention","kind":"approval"|"question",...}
 function notifyAttention(body) {
   if (!notificationsEnabled) return;
@@ -523,7 +530,9 @@ function quitApp() {
 /* ---------------- security hardening & window health ---------------- */
 // Least-privilege permissions (borrowed from bruc3van/dsh-desktop): the web UI
 // only needs clipboard write + fullscreen; cameras/mics/devices are denied.
-const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen']);
+// 'notifications' is allowed so future web-side notification plugins can work
+// (the shell's own notifications use Electron Notification, not this).
+const ALLOWED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen', 'notifications']);
 
 function installSecurityHooks() {
   try {
@@ -542,8 +551,12 @@ function installSecurityHooks() {
       return { action: 'deny' };
     });
     contents.on('will-navigate', (event, url) => {
-      const origin = (() => { try { return new URL(dshUrl).origin; } catch { return ''; } })();
-      if (origin === '' || !url.startsWith(origin)) event.preventDefault();
+      // Exact origin comparison: startsWith would mis-match ports sharing a
+      // prefix (127.0.0.1:6935 vs 127.0.0.1:69350).
+      let actual = '';
+      try { actual = new URL(url).origin; } catch { /* malformed url — deny below */ }
+      const expected = (() => { try { return new URL(dshUrl).origin; } catch { return ''; } })();
+      if (expected === '' || actual !== expected) event.preventDefault();
     });
   });
 }
@@ -590,7 +603,19 @@ if (!gotLock) {
         startDsh(portArg);
       }
       waitForDsh(ready => {
-        if (!ready) log('DSH service start timeout');
+        if (!ready) {
+          log('DSH service start timeout');
+          // Never leave a blank window: tell the user what happened and how
+          // to fix it instead of silently loading a dead URL.
+          dialog.showMessageBox({
+            type: 'warning',
+            title: APP_NAME,
+            message: 'DSH 服务启动超时',
+            detail: '请确认系统已安装 dsh（npm install -g @deepseek-ai/dsh），\n' +
+              '或查看日志：' + LOG_DIR,
+            buttons: ['OK'],
+          });
+        }
         createWindow();
         createTray();
       });
