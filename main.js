@@ -33,6 +33,9 @@ const POLL_TIMEOUT = 40000;
 // Shell state dir (logs, port persistence, settings). NOT used as DSH_HOME:
 // the app deliberately shares ~/.dsh with the dev web profile.
 const DATA_DIR = process.env.STABLEDSH_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH Lite');
+// The shared DeepSeek Harness home — never overridden, so API key, sessions,
+// plugins and skins are the same ones the dev web profile uses.
+const DSH_HOME = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'dsh-lite.log');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
@@ -102,12 +105,8 @@ function findNodeExe() {
 }
 
 function findDshEntry() {
-  const candidates = [
-    path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
-    path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'bin.js'),
-  ];
-  for (const c of candidates) if (fs.existsSync(c)) return c;
-  return null;
+  const candidate = path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  return fs.existsSync(candidate) ? candidate : null;
 }
 
 /* ---------------- DSH service probe (health check) ---------------- */
@@ -273,8 +272,7 @@ function startSessionWatcher() {
   const watcherJs = path.join(scriptsDir(), 'session-watcher.js');
   if (!nodeExe || !fs.existsSync(watcherJs)) { log('session watcher unavailable'); return; }
   // Sessions live in the shared DSH home (~/.dsh), same as the dev web profile.
-  const dshHome = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
-  const sessionsDir = path.join(dshHome, 'sessions');
+  const sessionsDir = path.join(DSH_HOME, 'sessions');
   fs.mkdirSync(sessionsDir, { recursive: true });
   watcherProc = spawn(nodeExe, [watcherJs, '--sessions', sessionsDir], {
     cwd: DATA_DIR,
@@ -287,8 +285,10 @@ function startSessionWatcher() {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-        if (msg.event === 'turnEnd') notifyTurnEnd(msg);
-        else if (msg.event === 'session' && typeof msg.cwd === 'string') {
+        if (msg.event === 'turnEnd') {
+          const body = msg.title ? '任务完成：「' + msg.title + '」' : '任务完成，点击查看详情';
+          showNotification(APP_NAME, body);
+        } else if (msg.event === 'session' && typeof msg.cwd === 'string') {
           lastCwd = msg.cwd;
           log('session cwd: ' + lastCwd);
         }
@@ -301,26 +301,25 @@ function startSessionWatcher() {
   });
 }
 
-function notifyTurnEnd(msg) {
+// One notification path for every event (task finished / approval / question).
+// Windows toasts do not steal focus; the user asked to know even with the
+// window open. Falls back to a tray balloon when toasts are unsupported.
+function showNotification(title, body) {
   if (!notificationsEnabled) return;
-  const body = msg.title ? '任务完成：「' + msg.title + '」' : '任务完成，点击查看详情';
-  log('task finished: ' + body);
-  // Always notify: Windows toasts do not steal focus; the user asked to know
-  // when a task finishes even with the window open.
+  log('notify: ' + body);
   if (Notification.isSupported()) {
-    const n = new Notification({ title: APP_NAME, body });
+    const n = new Notification({ title, body });
     n.on('click', () => showWindow());
     n.show();
   } else if (tray) {
-    tray.displayBalloon({ title: APP_NAME, content: body });
+    tray.displayBalloon({ title, content: body });
   }
 }
 
 // Open Windows Terminal (or PowerShell fallback) in the latest session's
 // working directory — modern look, not classic cmd.
 function openTerminal() {
-  const dshHome = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
-  const dir = lastCwd || dshHome;
+  const dir = lastCwd || DSH_HOME;
   const wt = spawn('wt.exe', ['-d', dir], { windowsHide: true, stdio: 'ignore' });
   wt.on('error', () => {
     // wt.exe missing -> PowerShell window fallback
@@ -337,18 +336,6 @@ function openTerminal() {
 // node has global WebSocket; the Electron main process node does not) connects
 // and reports attention events over stdout:
 //   {"event":"attention","kind":"approval"|"question",...}
-function notifyAttention(body) {
-  if (!notificationsEnabled) return;
-  log('attention: ' + body);
-  if (Notification.isSupported()) {
-    const n = new Notification({ title: APP_NAME, body: body || '' });
-    n.on('click', () => showWindow());
-    n.show();
-  } else if (tray) {
-    tray.displayBalloon({ title: APP_NAME, content: body || '' });
-  }
-}
-
 function startMuxWatcher(wsUrl) {
   if (muxProc && !muxProc.killed) {
     try { muxProc.kill(); } catch (e) { /* ignore */ }
@@ -371,10 +358,10 @@ function startMuxWatcher(wsUrl) {
         if (msg.event !== 'attention') continue;
         if (msg.kind === 'approval') {
           const reason = msg.reason ? '（' + msg.reason + '）' : '';
-          notifyAttention('需要你的审批：' + msg.toolName + reason);
+          showNotification(APP_NAME, '需要你的审批：' + msg.toolName + reason);
         } else if (msg.kind === 'question') {
           const head = msg.header ? '「' + msg.header + '」' : '';
-          notifyAttention('需要你回答' + head + '：' + (msg.question || '有一个问题等待你回答'));
+          showNotification(APP_NAME, '需要你回答' + head + '：' + (msg.question || '有一个问题等待你回答'));
         }
       } catch { /* partial line */ }
     }
@@ -390,14 +377,13 @@ function openDataDir() { fs.mkdirSync(DATA_DIR, { recursive: true }); shell.open
 function openLogDir() { fs.mkdirSync(LOG_DIR, { recursive: true }); shell.openPath(LOG_DIR); }
 function openPluginDir() {
   // Shared with the dev web profile: the plugin home is ~/.dsh\profiles\web.
-  const home = process.env.USERPROFILE || process.env.HOME || '.';
   const candidates = [
-    path.join(home, '.dsh', 'profiles', 'web', 'node_modules'),
-    path.join(home, '.dsh', 'profiles', 'node_modules'),
-    path.join(home, '.dsh'),
+    path.join(DSH_HOME, 'profiles', 'web', 'node_modules'),
+    path.join(DSH_HOME, 'profiles', 'node_modules'),
+    DSH_HOME,
   ];
   for (const c of candidates) if (fs.existsSync(c)) return shell.openPath(c);
-  shell.openPath(path.join(home, '.dsh'));
+  shell.openPath(DSH_HOME);
 }
 
 /* ---------------- tray ---------------- */
@@ -453,7 +439,7 @@ function showAbout() {
     message: APP_NAME + ' ' + pkg.version,
     detail: 'DeepSeek Harness Desktop Lite Edition (thin Electron shell)\n\n' +
       'Shell data: ' + DATA_DIR + '\n' +
-      'DSH home (shared with dev web profile): ' + path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh') + '\n' +
+      'DSH home (shared with dev web profile): ' + DSH_HOME + '\n' +
       'URL: ' + dshUrl + '\n' +
       'Runtime: system node + dsh (no bundled runtime)\n\n' +
       'Notifications (task finished / approval / question) via built-in watchers.',
