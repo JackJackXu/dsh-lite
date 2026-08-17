@@ -486,6 +486,9 @@ function setupCrashRecovery(win) {
       win.loadURL(dshUrl);
     }, delay);
   });
+  // A successful load means the retry counter is stale; reset it so a later
+  // transient failure still gets the full retry budget.
+  win.webContents.on('did-finish-load', () => { loadFailCount = 0; crashCount = 0; });
   win.webContents.on('render-process-gone', (_e, details) => {
     log('renderer gone: ' + details.reason + ' (crash #' + (crashCount + 1) + ')');
     crashCount += 1;
