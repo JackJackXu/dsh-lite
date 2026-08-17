@@ -51,13 +51,18 @@ function loadSettings() {
   try {
     const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
     if (typeof s.notifications === 'boolean') notificationsEnabled = s.notifications;
-  } catch { /* first run — defaults */ }
+  } catch (e) {
+    // First run (no file) is normal; a corrupt file should not silently reset
+    // the user's choices, so note it instead of swallowing it.
+    if (e && e.code !== 'ENOENT') log('settings file unreadable: ' + e.message);
+  }
 }
 
 function saveSettings() {
   try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ notifications: notificationsEnabled }, null, 2));
-  } catch { /* ignore */ }
+  } catch (e) { log('settings save failed: ' + (e && e.message || e)); }
 }
 
 // Bundled scripts dir (session-watcher.js, mux-watcher.js).
@@ -158,6 +163,26 @@ function findNodeExe() {
     if (fs.existsSync(c)) return c;
   }
   return null;
+}
+
+// The session watcher needs Node >= 22 (node:zlib zstd decompression) and the
+// mux watcher needs a global WebSocket (also Node >= 22). On an older system
+// node the notifications would silently never work, so verify the version once
+// at boot and surface a clear warning instead.
+const NODE_MIN_MAJOR = 22;
+function checkNodeVersion(nodeExe) {
+  return new Promise(resolve => {
+    try {
+      const proc = spawn(nodeExe, ['-p', 'process.versions.node'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      proc.stdout.on('data', buf => { out += buf.toString(); });
+      proc.on('error', () => resolve(null));
+      proc.on('exit', () => {
+        const m = /^v?(\d+)\./.exec(out.trim());
+        resolve(m ? Number(m[1]) : null);
+      });
+    } catch { resolve(null); }
+  });
 }
 
 // Locate the global @deepseek-ai/dsh entry across the common Node installers
@@ -294,6 +319,11 @@ function startDsh(portArg) {
   log('starting dsh web via system node: ' + nodeExe + ' (--port ' + portArg + ')');
   const env = Object.assign({}, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
+  // DSH_HOME is intentionally NOT honored: the shell and the spawned dsh must
+  // agree on the shared home (~/.dsh, the dev-web profile's data). If the
+  // user's environment sets DSH_HOME elsewhere, the spawned dsh would inherit
+  // it and diverge from what the watchers read — so pin it to the same value.
+  env.DSH_HOME = DSH_HOME;
   // No DSH_HOME override: share ~/.dsh with the dev web profile (API key,
   // sessions, plugins, skins). The spawned process inherits the user's PATH.
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -305,6 +335,7 @@ function startDsh(portArg) {
     windowsHide: true,
   });
   dshProc = proc;
+  proc.on('error', err => log('dsh spawn error: ' + err.message));
   // Line-buffered URL parsing: pipe chunks do not align to newlines, so the
   // "dsh web: http://…" line could be split across two chunks; parsing each
   // chunk alone would miss the URL (no port saved, no mux watcher, and a
@@ -378,6 +409,35 @@ function restartDsh() {
   }, 800);
 }
 
+/* ---------------- watcher supervision ---------------- */
+// Notifications are the shell's core feature; if a watcher dies (crash, dsh
+// API change, transient OS error) it must come back on its own instead of
+// silently killing the notifications. A generic supervisor wraps any
+// restartable child: exponential backoff up to a cap, and NO restart when the
+// shell is quitting or the watcher was killed on purpose.
+const WATCHER_MAX_RESTARTS = 5;
+const watcherRestarts = new Map(); // label -> count
+
+function superviseWatcher(proc, label, restartFn) {
+  proc.on('exit', code => {
+    // Stale-exit guard (the process may have been replaced already).
+    if (label === 'session' && watcherProc !== proc) return;
+    if (label === 'mux' && muxProc !== proc) return;
+    if (label === 'session') watcherProc = null;
+    if (label === 'mux') muxProc = null;
+    if (isQuitting) return;
+    const restarts = watcherRestarts.get(label) || 0;
+    if (restarts >= WATCHER_MAX_RESTARTS) {
+      log(label + ' watcher gave up after ' + restarts + ' restarts');
+      return;
+    }
+    const delay = Math.min(1000 * Math.pow(2, restarts), 8000);
+    watcherRestarts.set(label, restarts + 1);
+    log(label + ' watcher exited (code=' + code + ') — restarting in ' + delay + 'ms (#' + (restarts + 1) + ')');
+    setTimeout(restartFn, delay);
+  });
+}
+
 /* ---------------- session watcher (notifications + terminal dir) ---------------- */
 // Runs as a standalone node process (the system node has zstd support; the
 // Electron main process node does not). Prints JSON lines:
@@ -396,6 +456,7 @@ function startSessionWatcher() {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  proc.on('error', err => log('session watcher spawn error: ' + err.message));
   watcherProc = proc;
   // Line-buffered stdout parsing: pipe chunks do NOT align to newlines, so a
   // JSON line split across two chunks would otherwise be dropped (a lost
@@ -420,11 +481,7 @@ function startSessionWatcher() {
       } catch { /* partial/corrupt line */ }
     }
   });
-  proc.on('exit', code => {
-    // Stale-exit guard, same race as startDsh/startMuxWatcher.
-    if (watcherProc === proc) watcherProc = null;
-    if (!isQuitting) log('session watcher exited, code=' + code);
-  });
+  superviseWatcher(proc, 'session', startSessionWatcher);
 }
 
 // One notification path for every event (task finished / approval / question).
@@ -523,11 +580,9 @@ function startMuxWatcher(wsUrl) {
       } catch { /* partial/corrupt line */ }
     }
   });
-  proc.on('exit', code => {
-    // Stale-exit guard, same race as startDsh: a restart replaces muxProc
-    // before the old process's exit event arrives.
-    if (muxProc === proc) muxProc = null;
-    if (!isQuitting) log('mux watcher exited, code=' + code);
+  proc.on('error', err => log('mux watcher spawn error: ' + err.message));
+  superviseWatcher(proc, 'mux', () => {
+    if (muxUrl) startMuxWatcher(muxUrl);
   });
 }
 
@@ -591,11 +646,14 @@ function createTray() {
 }
 
 function showAbout() {
-  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+  let version = '?';
+  try {
+    version = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '?';
+  } catch (e) { log('about: package.json unreadable: ' + (e && e.message || e)); }
   dialog.showMessageBox(mainWindow, {
     type: 'info',
     title: 'About ' + PRODUCT_NAME,
-    message: PRODUCT_NAME + '\nv' + pkg.version,
+    message: PRODUCT_NAME + '\nv' + version,
     detail: 'DeepSeek Harness Desktop Lite Edition (thin Electron shell)\n\n' +
       'Shell data: ' + DATA_DIR + '\n' +
       'DSH home (shared with dev web profile): ' + DSH_HOME + '\n' +
@@ -651,15 +709,22 @@ function setupCrashRecovery(win) {
       }
     }, delay);
   });
+  let unresponsiveTimer = null;
   win.webContents.on('unresponsive', () => {
+    // One scheduled reload at a time: repeated 'unresponsive' events would
+    // otherwise pile up 5s timers.
+    if (unresponsiveTimer !== null) return;
     log('renderer unresponsive — scheduling reload');
-    setTimeout(() => {
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
       if (win.isDestroyed() || isQuitting) return;
       if (win.webContents.isCrashed && win.webContents.isCrashed()) return;
       win.webContents.reload();
     }, 5000);
   });
-  win.webContents.on('responsive', () => { /* recovered */ });
+  win.webContents.on('responsive', () => {
+    if (unresponsiveTimer !== null) { clearTimeout(unresponsiveTimer); unresponsiveTimer = null; }
+  });
 }
 
 function createWindow() {
@@ -789,7 +854,7 @@ if (!gotLock) {
 } else {
   app.on('second-instance', () => showWindow());
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     // Windows toast notifications require an AppUserModelID; without it they
     // may not appear or may be attributed to "Electron".
     if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
@@ -800,6 +865,13 @@ if (!gotLock) {
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     installSecurityHooks();
     installWakeRecovery();
+    // Node version gate: notifications need Node >= 22 (zstd + global
+    // WebSocket). Warn loudly instead of letting them fail silently.
+    const nodeExe = findNodeExe();
+    const nodeMajor = await checkNodeVersion(nodeExe);
+    if (nodeMajor !== null && nodeMajor < NODE_MIN_MAJOR) {
+      log('WARNING: system Node is v' + nodeMajor + ', watchers need v' + NODE_MIN_MAJOR + '+ — notifications disabled');
+    }
     startSessionWatcher();
     probeDsh(async ok => {
       if (ok) {
