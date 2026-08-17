@@ -1,9 +1,9 @@
 {
   "name": "dsh-lite",
   "version": "1.0.0",
-  "description": "DSH Lite — DeepSeek Harness Desktop Lite Edition: thin Electron shell (tray + notifications + security) sharing the dev ~/.dsh profile",
+  "description": "DSH DLE — DeepSeek Harness Desktop Lite Edition: thin Electron shell (tray + notifications + security) sharing the dev ~/.dsh profile",
   "main": "main.js",
-  "author": "DSH Lite",
+  "author": "DSH DLE",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
@@ -15,8 +15,8 @@
   },
   "build": {
     "appId": "com.deepseek.dshlite",
-    "productName": "DSH Lite",
-    "artifactName": "DSH-Lite-Setup-${version}.${ext}",
+    "productName": "DSH DLE",
+    "artifactName": "DSH-DLE-Setup-${version}.${ext}",
     "electronDist": "node_modules/electron/dist",
     "electronLanguages": [
       "en-US",
@@ -46,7 +46,7 @@
       "oneClick": true,
       "perMachine": false,
       "createDesktopShortcut": true,
-      "shortcutName": "DSH Lite",
+      "shortcutName": "DSH DLE",
       "deleteAppDataOnUninstall": false
     }
   },

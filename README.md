@@ -1,4 +1,4 @@
-# 🐋 DSH Lite（DeepSeek Harness Desktop Lite Edition）
+# 🐋 DSH DLE（DeepSeek Harness Desktop Lite Edition）
 
 DeepSeek Harness 的**轻薄桌面壳**：**Electron 窗口 + QQ 式托盘 + 安全加固 + 任务完成/审批通知**。
 不打包任何运行时（node / dsh），**直接复用你系统里已有的 node 和 dsh**——也就是开发版 webui 用的那套环境。
@@ -7,7 +7,7 @@ DeepSeek Harness 的**轻薄桌面壳**：**Electron 窗口 + QQ 式托盘 + 安
 
 ## 和 stableDSH 的区别
 
-| | stableDSH（旧） | **DSH Lite（现在）** |
+| | stableDSH（旧） | **DSH DLE（现在）** |
 |---|---|---|
 | 数据 | `%LOCALAPPDATA%\stableDSH`（独立 DSH_HOME，与开发环境隔离） | **共享 `~/.dsh`**（Key、会话、插件、皮肤与开发版完全一致） |
 | 运行环境 | 内置 node + dsh（可选） | **只用系统 node + dsh**，不内置 |
@@ -33,7 +33,7 @@ DeepSeek Harness 的**轻薄桌面壳**：**Electron 窗口 + QQ 式托盘 + 安
 
 ```bash
 npm install          # 一次性（装 electron + electron-builder）
-npm start            # 启动 DSH Lite（开发模式）
+npm start            # 启动 DSH DLE（开发模式）
 ```
 
 ## 打包
@@ -43,13 +43,13 @@ npm start            # 启动 DSH Lite（开发模式）
 ```powershell
 $env:ELECTRON_BUILDER_BINARIES_MIRROR="https://npmmirror.com/mirrors/electron-builder-binaries/"
 npx electron-builder --win
-# 产物: release\DSH-Lite-Setup-1.0.0.exe
+# 产物: release\DSH-DLE-Setup-1.0.0.exe
 ```
 
 ## 文件结构
 
 ```
-DSH Lite/
+DSH DLE/
 ├── main.js                  # 主进程（窗口 + 托盘 + 服务管理 + 单实例 + watcher）
 ├── package.json             # 项目定义 + electron-builder 配置
 ├── scripts/
@@ -68,7 +68,7 @@ DSH Lite/
 
 ## 数据
 
-- **DSH 数据**：`~/.dsh`（与开发版共享，**不要同时开**开发版 webui 和 DSH Lite）
+- **DSH 数据**：`~/.dsh`（与开发版共享，**不要同时开**开发版 webui 和 DSH DLE）
 - **壳自己的状态**：`%LOCALAPPDATA%\DSH Lite\`（日志、端口记录、通知开关设置）
 
 ## 已知事项

@@ -22,8 +22,9 @@ const net = require('net');
 // Full product name (window title, tray tooltip, About). The short name is
 // used where space is tight (notifications, log lines).
 const PRODUCT_NAME = 'DeepSeek Harness Desktop - Lite Edition';
-// Short name shown in notifications and logs; window/tray/about use the full name.
-const APP_NAME = 'DSH Lite';
+// Short name (acronym of the full name) shown in notifications and logs;
+// window/tray/about use the full name.
+const APP_NAME = 'DSH DLE';
 // The service is started with --port 0 so the OS assigns a free port (never
 // conflicts). The real URL is parsed from dsh's stdout line:
 //   "dsh web: http://127.0.0.1:<port>"
@@ -249,14 +250,14 @@ function stopDsh() {
 function restartDsh() {
   if (isRestarting) return;
   isRestarting = true;
-  if (tray) tray.setToolTip(APP_NAME + ' - restarting...');
+  if (tray) tray.setToolTip(PRODUCT_NAME + ' - restarting...');
   stopDsh();
   setTimeout(async () => {
     const portArg = await resolvePortArg();
     startDsh(portArg);
     waitForDsh(ok => {
       isRestarting = false;
-      if (tray) tray.setToolTip(APP_NAME);
+      if (tray) tray.setToolTip(PRODUCT_NAME);
       if (mainWindow) {
         if (ok) mainWindow.loadURL(dshUrl);
         else log('service restart timed out');
