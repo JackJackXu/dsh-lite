@@ -10,7 +10,7 @@
  *    the OS assigns a free one (parsed from stdout).
  *  - Single instance: a second launch focuses the existing window.
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
- *  - Logs to <dataDir>\logs\dsh-lite.log for plugin/service debugging.
+ *  - Logs to <dataDir>\logs\dsh-dle.log for plugin/service debugging.
  */
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor } = require('electron');
 const { spawn } = require('child_process');
@@ -36,12 +36,12 @@ const POLL_TIMEOUT = 40000;
 
 // Shell state dir (logs, port persistence, settings). NOT used as DSH_HOME:
 // the app deliberately shares ~/.dsh with the dev web profile.
-const DATA_DIR = process.env.DSH_DLE_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH Lite');
+const DATA_DIR = process.env.DSH_DLE_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH DLE');
 // The shared DeepSeek Harness home — never overridden, so API key, sessions,
 // plugins and skins are the same ones the dev web profile uses.
 const DSH_HOME = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
 const LOG_DIR = path.join(DATA_DIR, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'dsh-lite.log');
+const LOG_FILE = path.join(LOG_DIR, 'dsh-dle.log');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 // User settings (persisted). Only notifications toggle for now.
@@ -637,7 +637,7 @@ if (!gotLock) {
   app.whenReady().then(() => {
     // Windows toast notifications require an AppUserModelID; without it they
     // may not appear or may be attributed to "Electron".
-    if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshlite');
+    if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
     loadSettings();
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
     log('boot: ' + APP_NAME + ' v' + pkg.version);

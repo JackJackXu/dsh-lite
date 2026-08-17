@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// DSH Lite mux watcher — standalone node process (Node >= 22 has global
+// DSH DLE mux watcher — standalone node process (Node >= 22 has global
 // WebSocket; the system node is v24).
 //
 // Connects to the dsh web app's mux stream (WebSocket upgrade on

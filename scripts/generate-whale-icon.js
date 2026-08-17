@@ -1,6 +1,6 @@
 'use strict';
 
-// Generate the DSH Lite app icons from the pixel whale sprite
+// Generate the DSH DLE app icons from the pixel whale sprite
 // (mist-blue palette, from the dsh-terminal-skin plugin).
 // Outputs:
 //   assets/icon.ico        — multi-size ICO (16/32/48/64/128/256), packaged icon

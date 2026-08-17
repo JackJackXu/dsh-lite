@@ -27,7 +27,7 @@ DeepSeek Harness 的**轻薄桌面壳**：**Electron 窗口 + QQ 式托盘 + 安
 - **安全加固**：最小权限（仅剪贴板+全屏）、外链走系统浏览器、禁止导航离开 dsh origin
 - **唤醒恢复**：睡眠唤醒后自动检查服务存活并重连
 - **进程树回收**：退出时 `taskkill /T /F`，不留孤儿进程
-- **日志落盘**：`%LOCALAPPDATA%\DSH Lite\logs\`（壳层）+ `dsh-web.log`（服务输出）
+- **日志落盘**：`%LOCALAPPDATA%\DSH DLE\logs\`（壳层）+ `dsh-web.log`（服务输出）
 
 ## 开发运行（当前机器）
 
@@ -69,7 +69,7 @@ DSH DLE/
 ## 数据
 
 - **DSH 数据**：`~/.dsh`（与开发版共享，**不要同时开**开发版 webui 和 DSH DLE）
-- **壳自己的状态**：`%LOCALAPPDATA%\DSH Lite\`（日志、端口记录、通知开关设置）
+- **壳自己的状态**：`%LOCALAPPDATA%\DSH DLE\`（日志、端口记录、通知开关设置）
 
 ## 已知事项
 

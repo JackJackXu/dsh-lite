@@ -1,5 +1,5 @@
 {
-  "name": "dsh-lite",
+  "name": "dsh-dle",
   "version": "1.0.0",
   "description": "DSH DLE — DeepSeek Harness Desktop Lite Edition: thin Electron shell (tray + notifications + security) sharing the dev ~/.dsh profile",
   "main": "main.js",
@@ -14,7 +14,7 @@
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.deepseek.dshlite",
+    "appId": "com.deepseek.dshdle",
     "productName": "DSH DLE",
     "artifactName": "DSH-DLE-Setup-${version}.${ext}",
     "electronDist": "node_modules/electron/dist",
