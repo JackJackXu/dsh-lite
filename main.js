@@ -111,9 +111,34 @@ function findNodeExe() {
   return null;
 }
 
+// Locate the global @deepseek-ai/dsh entry across the common Node installers
+// (npm, pnpm, Volta, Scoop, nvm-windows) plus a PATH fallback. The shell only
+// needs the one bin.js file — the same environment the dev web profile uses.
 function findDshEntry() {
-  const candidate = path.join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  return fs.existsSync(candidate) ? candidate : null;
+  const rel = path.join('node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  const roots = [
+    // npm default (per-user) global root: %APPDATA%\npm
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : null,
+    // pnpm global (pnpm setup): %LOCALAPPDATA%\pnpm (Windows)
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'pnpm') : null,
+    // Volta global shims: %LOCALAPPDATA%\Volta\bin (Windows)
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Volta', 'bin') : null,
+    // nvm-windows: %NVM_HOME%\nodejs  (the active version's install root)
+    process.env.NVM_HOME ? path.join(process.env.NVM_HOME, 'nodejs') : null,
+  ];
+  for (const root of roots) {
+    if (!root) continue;
+    const c = path.join(root, rel);
+    if (fs.existsSync(c)) return c;
+  }
+  // PATH fallback (Scoop/Chocolatey/manual installs): any dir carrying
+  // node_modules/@deepseek-ai/dsh/lib/bin.js.
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue;
+    const c = path.join(dir, rel);
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
 }
 
 /* ---------------- DSH service probe (health check) ---------------- */
@@ -139,10 +164,17 @@ function probeDsh(cb) {
 
 function waitForDsh(cb) {
   const start = Date.now();
+  let done = false;
+  const once = result => {
+    if (done) return;
+    done = true;
+    clearInterval(timer);
+    cb(result);
+  };
   const timer = setInterval(() => {
     probeDsh(ok => {
-      if (ok) { clearInterval(timer); cb(true); }
-      else if (Date.now() - start > POLL_TIMEOUT) { clearInterval(timer); cb(false); }
+      if (ok) once(true);
+      else if (Date.now() - start > POLL_TIMEOUT) once(false);
     });
   }, POLL_INTERVAL);
 }
@@ -294,15 +326,24 @@ function startSessionWatcher() {
   // Sessions live in the shared DSH home (~/.dsh), same as the dev web profile.
   const sessionsDir = path.join(DSH_HOME, 'sessions');
   fs.mkdirSync(sessionsDir, { recursive: true });
-  watcherProc = spawn(nodeExe, [watcherJs, '--sessions', sessionsDir], {
+  const proc = spawn(nodeExe, [watcherJs, '--sessions', sessionsDir], {
     cwd: DATA_DIR,
     env: Object.assign({}, process.env),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  watcherProc.stdout.on('data', buf => {
-    for (const line of buf.toString().split('\n')) {
-      if (!line.trim()) continue;
+  watcherProc = proc;
+  // Line-buffered stdout parsing: pipe chunks do NOT align to newlines, so a
+  // JSON line split across two chunks would otherwise be dropped (a lost
+  // notification). Accumulate until the newline, then parse whole lines.
+  let outBuf = '';
+  proc.stdout.on('data', buf => {
+    outBuf += buf.toString();
+    let nl;
+    while ((nl = outBuf.indexOf('\n')) >= 0) {
+      const line = outBuf.slice(0, nl).trim();
+      outBuf = outBuf.slice(nl + 1);
+      if (!line) continue;
       try {
         const msg = JSON.parse(line);
         if (msg.event === 'turnEnd') {
@@ -312,11 +353,12 @@ function startSessionWatcher() {
           lastCwd = msg.cwd;
           log('session cwd: ' + lastCwd);
         }
-      } catch { /* partial line */ }
+      } catch { /* partial/corrupt line */ }
     }
   });
-  watcherProc.on('exit', code => {
-    watcherProc = null;
+  proc.on('exit', code => {
+    // Stale-exit guard, same race as startDsh/startMuxWatcher.
+    if (watcherProc === proc) watcherProc = null;
     if (!isQuitting) log('session watcher exited, code=' + code);
   });
 }
@@ -355,9 +397,13 @@ function openTerminal() {
   const dir = lastCwd || DSH_HOME;
   const wt = spawn('wt.exe', ['-d', dir], { windowsHide: true, stdio: 'ignore' });
   wt.on('error', () => {
-    // wt.exe missing -> PowerShell window fallback
+    // wt.exe missing -> PowerShell window fallback. Encode the command as
+    // UTF-16LE Base64 (-EncodedCommand) so a directory containing quotes or
+    // PowerShell metacharacters can never break out of the -LiteralPath arg.
     try {
-      spawn('powershell.exe', ['-NoExit', '-Command', "Set-Location -LiteralPath '" + dir + "'"], { windowsHide: true, stdio: 'ignore' });
+      const ps = "Set-Location -LiteralPath '" + dir.replace(/'/g, "''") + "'";
+      const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+      spawn('powershell.exe', ['-NoExit', '-EncodedCommand', encoded], { windowsHide: true, stdio: 'ignore' });
     } catch (e) { log('open terminal failed: ' + e.message); }
   });
 }
@@ -384,9 +430,16 @@ function startMuxWatcher(wsUrl) {
   });
   muxProc = proc;
   proc.stderr.on('data', buf => log('mux: ' + buf.toString().trim()));
+  // Line-buffered stdout parsing, same as the session watcher: pipe chunks do
+  // not align to newlines, so accumulate until the newline before parsing.
+  let outBuf = '';
   proc.stdout.on('data', buf => {
-    for (const line of buf.toString().split('\n')) {
-      if (!line.trim()) continue;
+    outBuf += buf.toString();
+    let nl;
+    while ((nl = outBuf.indexOf('\n')) >= 0) {
+      const line = outBuf.slice(0, nl).trim();
+      outBuf = outBuf.slice(nl + 1);
+      if (!line) continue;
       try {
         const msg = JSON.parse(line);
         if (msg.event !== 'attention') continue;
@@ -397,7 +450,7 @@ function startMuxWatcher(wsUrl) {
           const head = msg.header ? '「' + msg.header + '」' : '';
           showNotification(APP_NAME, '需要你回答' + head + '：' + (msg.question || '有一个问题等待你回答'));
         }
-      } catch { /* partial line */ }
+      } catch { /* partial/corrupt line */ }
     }
   });
   proc.on('exit', code => {

@@ -15,12 +15,35 @@
 const path = require('node:path');
 const fs = require('node:fs');
 
-const SHARP = 'C:/Users/XKangA/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/node_modules/sharp';
+// Resolve the global sharp dynamically instead of hardcoding a developer
+// username path: try require.resolve first (works when sharp is reachable),
+// then probe the common npm/pnpm global roots, then PATH.
+function resolveSharp() {
+  try {
+    return require.resolve('sharp');
+  } catch { /* not on this module's resolution path */ }
+  const rel = path.join('node_modules', 'sharp');
+  const roots = [
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : null,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'pnpm') : null,
+  ];
+  for (const root of roots) {
+    if (!root) continue;
+    const c = path.join(root, rel);
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
+const sharpPath = resolveSharp();
 let sharp;
+if (!sharpPath) {
+  console.error('sharp not found — install it globally (npm i -g sharp) or add its dir to PATH');
+  process.exit(1);
+}
 try {
-  sharp = require(SHARP);
+  sharp = require(sharpPath);
 } catch (e) {
-  console.error('sharp failed to load: ' + e.message);
+  console.error('sharp failed to load from ' + sharpPath + ': ' + e.message);
   process.exit(1);
 }
 
