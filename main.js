@@ -84,11 +84,35 @@ let isRestarting = false;
 let notifications = [];
 
 /* ---------------- logging ---------------- */
+// UTF-8 BOM (0xEF 0xBB 0xBF): Windows PowerShell and Notepad decode files
+// without a BOM using the legacy ANSI codepage (GBK on zh-CN systems), which
+// turns UTF-8 Chinese into mojibake. Stamp the BOM on file creation so every
+// reader auto-detects UTF-8; re-stamp it after the web-log truncation rewrite
+// (the kept tail starts at an arbitrary byte offset, so the BOM would be lost).
+const UTF8_BOM = '\uFEFF';
+
+function ensureUtf8Bom(file) {
+  try {
+    if (!fs.existsSync(file) || fs.statSync(file).size === 0) {
+      fs.writeFileSync(file, UTF8_BOM);
+      return;
+    }
+    // Existing non-empty file without a BOM: prepend one so legacy readers
+    // (PowerShell/Notepad on zh-CN) decode it as UTF-8. Reads the first 3
+    // bytes only, so this is cheap even on a multi-MB log.
+    const head = fs.readFileSync(file, { length: 3 });
+    if (head.length < 3 || head[0] !== 0xef || head[1] !== 0xbb || head[2] !== 0xbf) {
+      fs.writeFileSync(file, UTF8_BOM + fs.readFileSync(file).toString());
+    }
+  } catch { /* log dir unavailable */ }
+}
+
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
   console.log(line);
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
+    ensureUtf8Bom(LOG_FILE);
     fs.appendFileSync(LOG_FILE, line + '\n');
   } catch { /* log dir unavailable */ }
 }
@@ -193,8 +217,9 @@ function dshWebLog(data) {
       const mid = buf.length / 2;
       let start = buf.indexOf(0x0a, mid); // next newline after the midpoint
       if (start < 0) start = mid;
-      fs.writeFileSync(file, buf.subarray(start + 1));
+      fs.writeFileSync(file, UTF8_BOM + buf.subarray(start + 1).toString());
     }
+    ensureUtf8Bom(file);
     fs.appendFileSync(file, data);
   } catch { /* ignore */ }
 }
