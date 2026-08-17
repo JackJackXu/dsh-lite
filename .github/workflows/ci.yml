@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      # Syntax + type safety + bundle rebuild must all stay green.
+      - run: node --check main.js
+      - run: node --check scripts/session-watcher.js
+      - run: node --check scripts/mux-watcher.js
+      - run: node --check scripts/generate-whale-icon.js
+      - run: node --check scripts/make-icon-from-png.js
+      - run: node --check scripts/sprite-to-png.js

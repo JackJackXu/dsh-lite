@@ -83,6 +83,8 @@ let watcherProc = null;
 let lastCwd = null;
 let muxProc = null;
 let muxUrl = '';
+// Mux notification dedup: reconnect replays pending items; key -> last-seen ms.
+const muxSeen = new Map();
 let isQuitting = false;
 let isRestarting = false;
 // Live Notification handles: kept referenced so the OS never GCs a toast
@@ -142,6 +144,7 @@ function log(msg) {
   console.log(line);
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
+    truncateIfLarge(LOG_FILE);
     ensureUtf8Bom(LOG_FILE);
     fs.appendFileSync(LOG_FILE, line + '\n');
   } catch { /* log dir unavailable */ }
@@ -216,14 +219,15 @@ function findDshEntry() {
 }
 
 /* ---------------- DSH service probe (health check) ---------------- */
-function probeDsh(cb) {
+// Probe one URL: is a dsh web UI answering here? Timeout counts as "no".
+function probeUrl(url, cb) {
   let done = false;
   const once = result => {
     if (done) return;
     done = true;
     cb(result);
   };
-  const req = http.get(dshUrl, res => {
+  const req = http.get(url, res => {
     let body = '';
     res.on('data', c => {
       body += c;
@@ -234,6 +238,32 @@ function probeDsh(cb) {
   });
   req.on('error', () => once(false));
   req.setTimeout(1500, () => { req.destroy(); once(false); });
+}
+
+function probeDsh(cb) { probeUrl(dshUrl, cb); }
+
+// Scan the ports a dsh web UI could be running on — the dev webui's default
+// (3080), this shell's fallback (3081), and the port we last used — so an
+// already-running dsh is REUSED instead of starting a second instance that
+// writes the same ~/.dsh concurrently (corruption risk).
+function findExistingDsh(cb) {
+  const ports = [...new Set([
+    Number(process.env.DSH_DLE_PORT) || 0,
+    FALLBACK_PORT,
+    readLastPort(),
+    3080, // dev webui default
+  ].filter(p => p > 0))];
+  let i = 0;
+  const tryNext = () => {
+    if (i >= ports.length) { cb(null); return; }
+    const url = 'http://127.0.0.1:' + ports[i];
+    probeUrl(url, ok => {
+      if (ok) { cb(url); return; }
+      i += 1;
+      tryNext();
+    });
+  };
+  tryNext();
 }
 
 function waitForDsh(cb) {
@@ -254,24 +284,26 @@ function waitForDsh(cb) {
 }
 
 /* ---------------- service lifecycle ---------------- */
-// Cap the web log at ~5MB: dsh stdout can grow unboundedly over long sessions.
-// On overflow, keep the recent half. Truncate at a newline boundary so no
-// partial UTF-8 sequence or line is cut mid-way.
+// Cap logs at ~5MB (shell log and dsh-web.log): they can grow unboundedly
+// over long sessions. On overflow, keep the recent half. Truncate at a
+// newline boundary so no partial UTF-8 sequence or line is cut mid-way.
 const WEB_LOG_LIMIT = 5 * 1024 * 1024;
+
+function truncateIfLarge(file) {
+  if (!fs.existsSync(file) || fs.statSync(file).size <= WEB_LOG_LIMIT) return;
+  const buf = fs.readFileSync(file);
+  const mid = buf.length / 2;
+  let start = buf.indexOf(0x0a, mid); // next newline after the midpoint
+  if (start < 0) start = mid;
+  fs.writeFileSync(file, UTF8_BOM + buf.subarray(start + 1).toString());
+  bomVerified.add(file); // rewrite already stamped the BOM
+}
+
 function dshWebLog(data) {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
     const file = path.join(LOG_DIR, 'dsh-web.log');
-    if (fs.existsSync(file) && fs.statSync(file).size > WEB_LOG_LIMIT) {
-      const buf = fs.readFileSync(file);
-      const mid = buf.length / 2;
-      let start = buf.indexOf(0x0a, mid); // next newline after the midpoint
-      if (start < 0) start = mid;
-      fs.writeFileSync(file, UTF8_BOM + buf.subarray(start + 1).toString());
-      bomVerified.add(file); // rewrite already stamped the BOM
-      fs.appendFileSync(file, data);
-      return;
-    }
+    truncateIfLarge(file);
     ensureUtf8Bom(file);
     fs.appendFileSync(file, data);
   } catch { /* ignore */ }
@@ -289,12 +321,19 @@ function savePort(port) {
   try { fs.writeFileSync(PORT_FILE, String(port)); } catch { /* ignore */ }
 }
 
+// Port probe with an explicit three-way result:
+//   false -> busy (something answered on the port)
+//   true  -> free (connection refused / no listener)
+//   null  -> unknown (timeout) — retry before trusting it, a firewall or a
+//            half-open connection can make connect hang and "free" is wrong.
 function portFree(port) {
   return new Promise(resolve => {
+    let settled = false;
+    const finish = v => { if (!settled) { settled = true; socket.destroy(); resolve(v); } };
     const socket = net.connect({ port, host: '127.0.0.1' });
-    socket.on('connect', () => { socket.destroy(); resolve(false); });
-    socket.on('error', () => resolve(true));
-    socket.setTimeout(800, () => { socket.destroy(); resolve(true); });
+    socket.on('connect', () => finish(false));
+    socket.on('error', () => finish(true));
+    socket.setTimeout(800, () => finish(null));
   });
 }
 
@@ -302,11 +341,15 @@ function portFree(port) {
 async function resolvePortArg() {
   const lastPort = readLastPort();
   if (lastPort > 0) {
-    if (await portFree(lastPort)) {
+    // Unknown (timeout) → retry once before giving up on the last port; the
+    // timeout case is rare and usually transient.
+    let state = await portFree(lastPort);
+    if (state === null) state = await portFree(lastPort);
+    if (state === true) {
       log('reusing port ' + lastPort);
       return String(lastPort);
     }
-    log('port ' + lastPort + ' busy — falling back to random port');
+    log('port ' + lastPort + (state === false ? ' busy' : ' unknown') + ' — falling back to random port');
   }
   return '0';
 }
@@ -379,34 +422,54 @@ function startDsh(portArg) {
 }
 
 // Kill the whole process tree: dsh spawns pwsh/agent children that would
-// otherwise linger after exit.
-function stopDsh() {
-  if (dshProc && dshProc.pid) {
-    try {
-      spawn('taskkill', ['/PID', String(dshProc.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    } catch (e) {
-      try { dshProc.kill(); } catch (x) { /* ignore */ }
-    }
+// otherwise linger after exit. taskkill /T /F is the reliable Windows way;
+// wait for it (with a kill() fallback and a timeout) so a quit never leaves
+// a half-dead tree behind.
+function killTree(proc, cb) {
+  if (!proc || !proc.pid) { if (cb) cb(); return; }
+  const pid = proc.pid;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    if (cb) cb();
+  };
+  try {
+    const tk = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    // taskkill spawn error (unlikely) → fall back to a plain kill.
+    tk.on('error', () => { try { proc.kill(); } catch { /* already dead */ } finish(); });
+    tk.on('exit', () => finish());
+    // Safety net: taskkill exit can be missed if the process tree is weird.
+    setTimeout(finish, 3000);
+  } catch {
+    try { proc.kill(); } catch { /* already dead */ }
+    finish();
   }
+}
+
+function stopDsh(cb) {
+  if (dshProc && dshProc.pid) killTree(dshProc, cb);
+  else if (cb) cb();
 }
 
 function restartDsh() {
   if (isRestarting) return;
   isRestarting = true;
   if (tray) tray.setToolTip(PRODUCT_NAME + ' - restarting...');
-  stopDsh();
-  setTimeout(async () => {
-    const portArg = await resolvePortArg();
-    startDsh(portArg);
-    waitForDsh(ok => {
-      isRestarting = false;
-      if (tray) tray.setToolTip(PRODUCT_NAME);
-      if (mainWindow) {
-        if (ok) mainWindow.loadURL(dshUrl);
-        else log('service restart timed out');
-      }
-    });
-  }, 800);
+  stopDsh(() => {
+    setTimeout(async () => {
+      const portArg = await resolvePortArg();
+      startDsh(portArg);
+      waitForDsh(ok => {
+        isRestarting = false;
+        if (tray) tray.setToolTip(PRODUCT_NAME);
+        if (mainWindow) {
+          if (ok) mainWindow.loadURL(dshUrl);
+          else log('service restart timed out');
+        }
+      });
+    }, 800);
+  });
 }
 
 /* ---------------- watcher supervision ---------------- */
@@ -570,6 +633,15 @@ function startMuxWatcher(wsUrl) {
       try {
         const msg = JSON.parse(line);
         if (msg.event !== 'attention') continue;
+        // Dedup: a mux reconnect replays still-pending approvals/questions,
+        // so the same item can arrive repeatedly. Within a 10-minute window,
+        // identical content only notifies once.
+        const key = msg.kind === 'approval'
+          ? 'a:' + (msg.toolName || '') + ':' + (msg.reason || '')
+          : 'q:' + (msg.header || '') + ':' + (msg.question || '');
+        const now = Date.now();
+        if (muxSeen.has(key) && now - muxSeen.get(key) < 10 * 60 * 1000) continue;
+        muxSeen.set(key, now);
         if (msg.kind === 'approval') {
           const reason = msg.reason ? '（' + msg.reason + '）' : '';
           showNotification(APP_NAME, '需要你的审批：' + msg.toolName + reason);
@@ -773,14 +845,16 @@ function showWindow() {
 
 function quitApp() {
   isQuitting = true;
-  stopDsh();
-  if (watcherProc && !watcherProc.killed) {
-    try { watcherProc.kill(); } catch (e) { /* ignore */ }
-  }
-  if (muxProc && !muxProc.killed) {
-    try { muxProc.kill(); } catch (e) { /* ignore */ }
-  }
-  app.quit();
+  // Kill all children and wait for the tree kill to finish before quitting —
+  // otherwise taskkill (async) races app.quit() and node.exe processes linger.
+  const children = [dshProc, watcherProc, muxProc].filter(Boolean);
+  if (children.length === 0) { app.quit(); return; }
+  let remaining = children.length;
+  const done = () => {
+    remaining -= 1;
+    if (remaining === 0) app.quit();
+  };
+  for (const p of children) killTree(p, done);
 }
 
 /* ---------------- security hardening & window health ---------------- */
@@ -844,8 +918,27 @@ function installWakeRecovery() {
 
 /* ---------------- app lifecycle ---------------- */
 // Surface unexpected main-process errors instead of dying silently — the log
-// is where every other diagnostic lands, so route them there too.
-process.on('uncaughtException', (err) => { try { log('uncaughtException: ' + (err && err.stack || err)); } catch { /* ignore */ } });
+// is where every other diagnostic lands. A single stray rejection is usually
+// recoverable; repeated crashes mean the shell is in a bad state, so surface
+// a dialog (without force-quitting: the crash-recovery already rebuilds the
+// window, and the user can restart from the tray).
+let uncaughtStreak = 0;
+process.on('uncaughtException', (err) => {
+  try { log('uncaughtException: ' + (err && err.stack || err)); } catch { /* ignore */ }
+  uncaughtStreak += 1;
+  if (uncaughtStreak >= 3) {
+    uncaughtStreak = 0;
+    try {
+      dialog.showMessageBox({
+        type: 'warning',
+        title: APP_NAME,
+        message: 'DSH DLE 主进程连续出错',
+        detail: '请从托盘菜单「重启服务」或退出后重新启动。详情见日志：' + LOG_DIR,
+        buttons: ['OK'],
+      });
+    } catch { /* dialog unavailable */ }
+  }
+});
 process.on('unhandledRejection', (reason) => { try { log('unhandledRejection: ' + (reason instanceof Error ? reason.stack : String(reason))); } catch { /* ignore */ } });
 
 const gotLock = app.requestSingleInstanceLock();
@@ -873,11 +966,13 @@ if (!gotLock) {
       log('WARNING: system Node is v' + nodeMajor + ', watchers need v' + NODE_MIN_MAJOR + '+ — notifications disabled');
     }
     startSessionWatcher();
-    probeDsh(async ok => {
-      if (ok) {
-        // Reusing an already-running dsh (dev webui or a previous shell):
-        // the stdout URL-parser never ran, so start the mux watcher here —
-        // otherwise approval/question notifications would silently stay off.
+    findExistingDsh(async foundUrl => {
+      if (foundUrl) {
+        // Reusing an already-running dsh (dev webui on 3080, a previous shell,
+        // or our last port): the stdout URL-parser never ran, so update the
+        // URL and start the mux watcher — otherwise approval/question
+        // notifications would silently stay off.
+        dshUrl = foundUrl;
         log('reusing existing dsh at ' + dshUrl);
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
       } else {
