@@ -136,10 +136,19 @@ function waitForDsh(cb) {
 }
 
 /* ---------------- service lifecycle ---------------- */
+// Cap the web log at ~5MB: dsh stdout can grow unboundedly over long sessions.
+// On overflow, keep the tail half and restart — cheap rotation, no deps.
+const WEB_LOG_LIMIT = 5 * 1024 * 1024;
 function dshWebLog(data) {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    fs.appendFileSync(path.join(LOG_DIR, 'dsh-web.log'), data);
+    const file = path.join(LOG_DIR, 'dsh-web.log');
+    if (fs.existsSync(file) && fs.statSync(file).size > WEB_LOG_LIMIT) {
+      const buf = fs.readFileSync(file);
+      const tail = buf.subarray(buf.length / 2); // keep the recent half
+      fs.writeFileSync(file, tail);
+    }
+    fs.appendFileSync(file, data);
   } catch { /* ignore */ }
 }
 
@@ -458,6 +467,26 @@ let crashCount = 0;
 const CRASH_LIMIT = 4;
 
 function setupCrashRecovery(win) {
+  // Page load failure (service slow to answer, transient network blip): retry
+  // with backoff instead of leaving a blank window; give up after a few tries.
+  let loadFailCount = 0;
+  const LOAD_FAIL_LIMIT = 5;
+  win.webContents.on('did-fail-load', (_e, code, desc, _url, isMainFrame) => {
+    if (!isMainFrame || win.isDestroyed() || isQuitting) return;
+    // code -3 (ERR_ABORTED) is a normal navigation cancellation, not a failure.
+    if (code === -3) return;
+    loadFailCount += 1;
+    log('page load failed (' + code + ' ' + desc + ') attempt #' + loadFailCount);
+    if (loadFailCount >= LOAD_FAIL_LIMIT) {
+      log('page load giving up after ' + LOAD_FAIL_LIMIT + ' attempts');
+      return;
+    }
+    const delay = Math.min(1000 * Math.pow(2, loadFailCount - 1), 8000);
+    setTimeout(() => {
+      if (win.isDestroyed() || isQuitting) return;
+      win.loadURL(dshUrl);
+    }, delay);
+  });
   win.webContents.on('render-process-gone', (_e, details) => {
     log('renderer gone: ' + details.reason + ' (crash #' + (crashCount + 1) + ')');
     crashCount += 1;
@@ -496,7 +525,12 @@ function createWindow() {
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
     autoHideMenuBar: true,
     backgroundColor: '#1a1a1a',
-    webPreferences: { nodeIntegration: false, contextIsolation: true },
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,        // renderer process sandbox (like anywhere desktop)
+      webSecurity: true,    // explicit same-origin policy (default, made visible)
+    },
   });
 
   mainWindow.loadURL(dshUrl);
@@ -541,23 +575,28 @@ function installSecurityHooks() {
     session.defaultSession.setDevicePermissionHandler(() => false);
   } catch (e) { log('permission handler setup failed: ' + e.message); }
   // Every webContents: deny popup windows, send http(s) links to the system
-  // browser, block navigation away from the dsh origin.
+  // browser, block navigation away from the dsh origin (including iframes and
+  // redirects), and forbid <webview> tags (sandbox escape vector).
   app.on('web-contents-created', (_e, contents) => {
     contents.setWindowOpenHandler(({ url }) => {
       try {
         const p = new URL(url);
-        if (p.protocol === 'http:' || p.protocol === 'https:') shell.openExternal(url);
+        if (p.protocol === 'http:' || p.protocol === 'https:' || p.protocol === 'mailto:') shell.openExternal(url);
       } catch { /* malformed url */ }
       return { action: 'deny' };
     });
-    contents.on('will-navigate', (event, url) => {
+    contents.on('will-attach-webview', (event) => { event.preventDefault(); });
+    const guardNavigation = (event, url) => {
       // Exact origin comparison: startsWith would mis-match ports sharing a
       // prefix (127.0.0.1:6935 vs 127.0.0.1:69350).
       let actual = '';
       try { actual = new URL(url).origin; } catch { /* malformed url — deny below */ }
       const expected = (() => { try { return new URL(dshUrl).origin; } catch { return ''; } })();
       if (expected === '' || actual !== expected) event.preventDefault();
-    });
+    };
+    contents.on('will-frame-navigate', guardNavigation); // covers iframes
+    contents.on('will-navigate', guardNavigation);       // main frame
+    contents.on('will-redirect', guardNavigation);       // redirects
   });
 }
 
@@ -582,6 +621,11 @@ function installWakeRecovery() {
 }
 
 /* ---------------- app lifecycle ---------------- */
+// Surface unexpected main-process errors instead of dying silently — the log
+// is where every other diagnostic lands, so route them there too.
+process.on('uncaughtException', (err) => { try { log('uncaughtException: ' + (err && err.stack || err)); } catch { /* ignore */ } });
+process.on('unhandledRejection', (reason) => { try { log('unhandledRejection: ' + (reason instanceof Error ? reason.stack : String(reason))); } catch { /* ignore */ } });
+
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
@@ -589,6 +633,9 @@ if (!gotLock) {
   app.on('second-instance', () => showWindow());
 
   app.whenReady().then(() => {
+    // Windows toast notifications require an AppUserModelID; without it they
+    // may not appear or may be attributed to "Electron".
+    if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshlite');
     loadSettings();
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
     log('boot: ' + APP_NAME + ' v' + pkg.version);
