@@ -1,5 +1,5 @@
 /**
- * main.js — DSH Lite (DeepSeek Harness Desktop Lite Edition)
+ * main.js — DSH DLE (DeepSeek Harness Desktop Lite Edition)
  *
  * Design:
  *  - Thin Electron shell: uses the SYSTEM node + dsh (the same environment as
@@ -29,14 +29,14 @@ const APP_NAME = 'DSH DLE';
 // conflicts). The real URL is parsed from dsh's stdout line:
 //   "dsh web: http://127.0.0.1:<port>"
 // FALLBACK_PORT is used only if that line never arrives.
-const FALLBACK_PORT = Number(process.env.STABLEDSH_PORT || 3081);
+const FALLBACK_PORT = Number(process.env.DSH_DLE_PORT || 3081);
 let dshUrl = 'http://127.0.0.1:' + FALLBACK_PORT;
 const POLL_INTERVAL = 800;
 const POLL_TIMEOUT = 40000;
 
 // Shell state dir (logs, port persistence, settings). NOT used as DSH_HOME:
 // the app deliberately shares ~/.dsh with the dev web profile.
-const DATA_DIR = process.env.STABLEDSH_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH Lite');
+const DATA_DIR = process.env.DSH_DLE_HOME || path.join(process.env.LOCALAPPDATA || process.env.USERPROFILE || '.', 'DSH Lite');
 // The shared DeepSeek Harness home — never overridden, so API key, sessions,
 // plugins and skins are the same ones the dev web profile uses.
 const DSH_HOME = path.join(process.env.USERPROFILE || process.env.HOME || '.', '.dsh');
@@ -91,7 +91,7 @@ function log(msg) {
 }
 
 /* ---------------- system environment lookup ---------------- */
-// DSH Lite uses the system Node.js and dsh installation (the same environment
+// DSH DLE uses the system Node.js and dsh installation (the same environment
 // the dev web profile runs on), so data/plugins/skins are shared automatically.
 function findNodeExe() {
   const candidates = [
@@ -140,7 +140,8 @@ function waitForDsh(cb) {
 
 /* ---------------- service lifecycle ---------------- */
 // Cap the web log at ~5MB: dsh stdout can grow unboundedly over long sessions.
-// On overflow, keep the tail half and restart — cheap rotation, no deps.
+// On overflow, keep the recent half. Truncate at a newline boundary so no
+// partial UTF-8 sequence or line is cut mid-way.
 const WEB_LOG_LIMIT = 5 * 1024 * 1024;
 function dshWebLog(data) {
   try {
@@ -148,8 +149,10 @@ function dshWebLog(data) {
     const file = path.join(LOG_DIR, 'dsh-web.log');
     if (fs.existsSync(file) && fs.statSync(file).size > WEB_LOG_LIMIT) {
       const buf = fs.readFileSync(file);
-      const tail = buf.subarray(buf.length / 2); // keep the recent half
-      fs.writeFileSync(file, tail);
+      const mid = buf.length / 2;
+      let start = buf.indexOf(0x0a, mid); // next newline after the midpoint
+      if (start < 0) start = mid;
+      fs.writeFileSync(file, buf.subarray(start + 1));
     }
     fs.appendFileSync(file, data);
   } catch { /* ignore */ }
