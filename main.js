@@ -77,6 +77,7 @@ let dshProc = null;
 let watcherProc = null;
 let lastCwd = null;
 let muxProc = null;
+let muxUrl = '';
 let isQuitting = false;
 let isRestarting = false;
 // Live Notification handles: kept referenced so the OS never GCs a toast
@@ -91,19 +92,43 @@ let notifications = [];
 // (the kept tail starts at an arbitrary byte offset, so the BOM would be lost).
 const UTF8_BOM = '\uFEFF';
 
-function ensureUtf8Bom(file) {
+// Reads exactly the first 3 bytes via openSync+readSync. fs.readFileSync does
+// NOT honor a {length} option (it returns the whole file), so the naive
+// `fs.readFileSync(file, {length:3})` would re-read a multi-MB log on every
+// write — O(n²) once the log grows. This helper is the cheap path.
+function readFileHead3(file) {
+  const fd = fs.openSync(file, 'r');
   try {
-    if (!fs.existsSync(file) || fs.statSync(file).size === 0) {
+    const buf = Buffer.alloc(3);
+    const n = fs.readSync(fd, buf, 0, 3, 0);
+    return buf.subarray(0, n);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Files already verified to carry a BOM: skip re-checking on every log write
+// (a stat + 3-byte read per line is fine, but unnecessary once confirmed).
+const bomVerified = new Set();
+
+function ensureUtf8Bom(file) {
+  if (bomVerified.has(file)) return;
+  try {
+    if (!fs.existsSync(file)) {
       fs.writeFileSync(file, UTF8_BOM);
+      bomVerified.add(file);
       return;
     }
-    // Existing non-empty file without a BOM: prepend one so legacy readers
-    // (PowerShell/Notepad on zh-CN) decode it as UTF-8. Reads the first 3
-    // bytes only, so this is cheap even on a multi-MB log.
-    const head = fs.readFileSync(file, { length: 3 });
+    if (fs.statSync(file).size === 0) {
+      fs.writeFileSync(file, UTF8_BOM);
+      bomVerified.add(file);
+      return;
+    }
+    const head = readFileHead3(file);
     if (head.length < 3 || head[0] !== 0xef || head[1] !== 0xbb || head[2] !== 0xbf) {
       fs.writeFileSync(file, UTF8_BOM + fs.readFileSync(file).toString());
     }
+    bomVerified.add(file);
   } catch { /* log dir unavailable */ }
 }
 
@@ -218,6 +243,9 @@ function dshWebLog(data) {
       let start = buf.indexOf(0x0a, mid); // next newline after the midpoint
       if (start < 0) start = mid;
       fs.writeFileSync(file, UTF8_BOM + buf.subarray(start + 1).toString());
+      bomVerified.add(file); // rewrite already stamped the BOM
+      fs.appendFileSync(file, data);
+      return;
     }
     ensureUtf8Bom(file);
     fs.appendFileSync(file, data);
@@ -277,18 +305,29 @@ function startDsh(portArg) {
     windowsHide: true,
   });
   dshProc = proc;
+  // Line-buffered URL parsing: pipe chunks do not align to newlines, so the
+  // "dsh web: http://…" line could be split across two chunks; parsing each
+  // chunk alone would miss the URL (no port saved, no mux watcher, and a
+  // spurious 40s startup timeout). Accumulate until the newline, then match.
+  let outBuf = '';
   proc.stdout.on('data', buf => {
     const text = buf.toString();
     dshWebLog(text);
-    const m = /dsh web: (https?:\/\/127\.0\.0\.1:\d+)/.exec(text);
-    if (m) {
-      dshUrl = m[1];
-      try {
-        const port = Number(new URL(dshUrl).port);
-        if (port > 0) savePort(port);
-      } catch { /* ignore */ }
-      log('resolved dsh url: ' + dshUrl);
-      startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
+    outBuf += text;
+    let nl;
+    while ((nl = outBuf.indexOf('\n')) >= 0) {
+      const line = outBuf.slice(0, nl);
+      outBuf = outBuf.slice(nl + 1);
+      const m = /dsh web: (https?:\/\/127\.0\.0\.1:\d+)/.exec(line);
+      if (m) {
+        dshUrl = m[1];
+        try {
+          const port = Number(new URL(dshUrl).port);
+          if (port > 0) savePort(port);
+        } catch { /* ignore */ }
+        log('resolved dsh url: ' + dshUrl);
+        startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
+      }
     }
   });
   proc.stderr.on('data', buf => dshWebLog(buf.toString()));
@@ -441,9 +480,15 @@ function openTerminal() {
 // and reports attention events over stdout:
 //   {"event":"attention","kind":"approval"|"question",...}
 function startMuxWatcher(wsUrl) {
+  // Idempotence: the URL can be announced both from stdout parsing (when this
+  // shell spawns dsh) and from the reuse branch (when an external dsh is
+  // already running). Only (re)start when the watcher is dead or the URL
+  // changed — otherwise a duplicate spawn would pile up mux processes.
+  if (muxProc && !muxProc.killed && muxUrl === wsUrl) return;
   if (muxProc && !muxProc.killed) {
     try { muxProc.kill(); } catch (e) { /* ignore */ }
   }
+  muxUrl = wsUrl;
   const nodeExe = findNodeExe();
   const muxJs = path.join(scriptsDir(), 'mux-watcher.js');
   if (!nodeExe || !fs.existsSync(muxJs)) { log('mux watcher unavailable'); return; }
@@ -640,9 +685,15 @@ function createWindow() {
   setupCrashRecovery(mainWindow);
 
   mainWindow.on('close', e => {
-    if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
+    // Tray app: closing hides instead of quitting (unless actually quitting).
+    // Hide the closing window itself, not the module-level mainWindow — a
+    // crash rebuild may have replaced it by the time a stale close fires.
+    if (!isQuitting) { e.preventDefault(); win.hide(); }
   });
-  mainWindow.on('closed', () => { mainWindow = null; });
+  // Stale-close guard (same pattern as the subprocess exit handlers): a crash
+  // rebuild destroys the old window and creates a new one; the old window's
+  // async 'closed' event must not null out the NEW mainWindow reference.
+  mainWindow.on('closed', () => { if (mainWindow === win) mainWindow = null; });
   // Keep the window title stable: dsh pages rewrite document.title on load,
   // which would overwrite the product name in the title bar.
   mainWindow.on('page-title-updated', e => e.preventDefault());
@@ -751,7 +802,13 @@ if (!gotLock) {
     installWakeRecovery();
     startSessionWatcher();
     probeDsh(async ok => {
-      if (!ok) {
+      if (ok) {
+        // Reusing an already-running dsh (dev webui or a previous shell):
+        // the stdout URL-parser never ran, so start the mux watcher here —
+        // otherwise approval/question notifications would silently stay off.
+        log('reusing existing dsh at ' + dshUrl);
+        startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
+      } else {
         const portArg = await resolvePortArg();
         startDsh(portArg);
       }
