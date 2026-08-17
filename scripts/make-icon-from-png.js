@@ -1,9 +1,10 @@
 'use strict';
 
-// Generate DSH DLE icons from a user-drawn 32x32 pixel-art PNG.
+// Generate DSH DLE icons from a user-drawn pixel-art PNG.
 //
-// The source is a 640x640 PNG = 32x32 grid scaled 20x. This script:
-//   1. downsamples to a 32x32 grid (majority color per cell),
+// The source is a square grid scaled 20x (16x16 = 320x320, 32x32 = 640x640).
+// This script:
+//   1. downsamples to an NxN grid (majority color per cell),
 //   2. turns the outer white background transparent (flood fill from edges;
 //      interior whites such as the mouth are kept),
 //   3. renders 256px PNG + multi-size ICO.
@@ -23,7 +24,9 @@ try {
   process.exit(1);
 }
 
-const PALETTE = { D: [20, 38, 96], B: [78, 111, 255], L: [190, 225, 255], W: [255, 255, 255] };
+// User's palette: K=black outline/water, B=bright blue body, L=light belly,
+// W=white (kept for interior whites). 'T' is transparent.
+const PALETTE = { K: [0, 0, 0], B: [0, 0, 255], L: [153, 202, 255], W: [255, 255, 255] };
 
 function quantize(r, g, b) {
   if (r > 245 && g > 245 && b > 245) return 'W';
@@ -38,9 +41,11 @@ function quantize(r, g, b) {
 async function extractGrid(file) {
   const { data, info } = await sharp(file).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const W = info.width, H = info.height;
-  const N = 32;
+  // Grid size: prefer the user's 16x16 source; fall back to 32x32 for the
+  // older 640px sources. 320px is only 16x16 (16*20), 640px is 32x32.
+  const N = W === 320 ? 16 : 32;
   const CELL = Math.round(W / N);
-  if (W % N !== 0) console.warn('width ' + W + ' not a multiple of 32; cell=' + CELL);
+  if (W % N !== 0) console.warn('width ' + W + ' not a multiple of ' + N + '; cell=' + CELL);
   const grid = [];
   for (let gy = 0; gy < N; gy++) {
     for (let gx = 0; gx < N; gx++) {
@@ -184,13 +189,13 @@ function buildIco(entries) {
 (async () => {
   const src = process.argv[2];
   if (!src) { console.error('usage: node make-icon-from-png.js <source.png>'); process.exit(1); }
-  const N = 32;
   let grid = await extractGrid(src);
+  const N = Math.round(Math.sqrt(grid.length));
   grid = transparentizeBackground(grid, N);
 
   // ASCII preview of the result (T=transparent)
-  const map = { D: '#', B: 'O', L: '.', W: 'w', '?': '?', T: ' ' };
-  console.log('--- extracted 32x32 grid (after background removal) ---');
+  const map = { K: '#', B: 'O', L: '.', W: 'w', '?': '?', T: ' ' };
+  console.log('--- extracted ' + N + 'x' + N + ' grid (after background removal) ---');
   for (let y = 0; y < N; y++) {
     console.log(grid.slice(y * N, (y + 1) * N).map(c => map[c] || '?').join(''));
   }
