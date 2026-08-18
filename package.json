@@ -27,6 +27,7 @@
     ],
     "files": [
       "main.js",
+      "scripts/port-utils.js",
       "assets/**/*",
       "package.json"
     ],
@@ -38,10 +39,6 @@
       {
         "from": "scripts/mux-watcher.js",
         "to": "scripts/mux-watcher.js"
-      },
-      {
-        "from": "scripts/port-utils.js",
-        "to": "scripts/port-utils.js"
       }
     ],
     "directories": {
