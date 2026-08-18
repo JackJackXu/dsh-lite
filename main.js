@@ -78,6 +78,9 @@ function scriptsDir() {
 
 let mainWindow = null;
 let tray = null;
+// Tooltip to apply once the tray exists: setToolTip before createTray is a
+// no-op (tray is null during boot), so stage it here instead.
+let pendingTooltip = null;
 let dshProc = null;
 // Does this shell own the running dsh process? false = reusing an external
 // dsh (dev webui, another shell). Guards Restart: we must not spawn a second
@@ -97,6 +100,13 @@ let isRestarting = false;
 // Live Notification handles: kept referenced so the OS never GCs a toast
 // before it shows (see showNotification).
 let notifications = [];
+
+// Set the tray tooltip, staging it if the tray does not exist yet (boot-time
+// calls before createTray would otherwise be silently lost).
+function setTrayTooltip(text) {
+  if (tray) { tray.setToolTip(text); return; }
+  pendingTooltip = text;
+}
 
 /* ---------------- logging ---------------- */
 // UTF-8 BOM (0xEF 0xBB 0xBF): Windows PowerShell and Notepad decode files
@@ -378,7 +388,7 @@ async function resolvePortArg() {
   return '0';
 }
 
-function startDsh(portArg) {
+function startDsh(portArg, onSpawnError) {
   const entry = findDshEntry();
   if (!entry) { log('dsh entry not found (system)'); return null; }
   const nodeExe = findNodeExe();
@@ -406,6 +416,7 @@ function startDsh(portArg) {
     if (dshProc === proc) dshProc = null;
     // ownsDsh stays true: a shell-started dsh that failed to spawn should
     // still be retried by Restart, not mistaken for an external service.
+    if (typeof onSpawnError === 'function') onSpawnError(err);
   });
   // Line-buffered URL parsing: pipe chunks do not align to newlines, so the
   // "dsh web: http://…" line could be split across two chunks; parsing each
@@ -428,7 +439,7 @@ function startDsh(portArg) {
           if (port > 0) savePort(port);
         } catch { /* ignore */ }
         log('resolved dsh url: ' + dshUrl);
-        if (tray) tray.setToolTip(PRODUCT_NAME + ' — 本壳启动 dsh');
+        setTrayTooltip(PRODUCT_NAME + ' — 本壳启动 dsh');
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
       }
     }
@@ -502,14 +513,14 @@ function restartDsh() {
     return;
   }
   isRestarting = true;
-  if (tray) tray.setToolTip(PRODUCT_NAME + ' - restarting...');
+  setTrayTooltip(PRODUCT_NAME + ' - restarting...');
   stopDsh(() => {
     setTimeout(async () => {
       const portArg = await resolvePortArg();
       startDsh(portArg);
       waitForDsh(ok => {
         isRestarting = false;
-        if (tray) tray.setToolTip(PRODUCT_NAME);
+        setTrayTooltip(PRODUCT_NAME);
         if (mainWindow) {
           if (ok) mainWindow.loadURL(dshUrl);
           else log('service restart timed out');
@@ -530,9 +541,9 @@ const watcherRestarts = new Map(); // label -> count
 
 // Heartbeat: a watcher that is alive but hung (never exits, never emits)
 // would otherwise slip past the exit-based supervision forever. Each watcher
-// prints {"event":"heartbeat"} every HEARTBEAT_INTERVAL; if the main process
-// sees nothing for HEARTBEAT_TIMEOUT it force-kills and restarts.
-const HEARTBEAT_INTERVAL = 30 * 1000;
+// prints {"event":"heartbeat"} every 30s (hardcoded in the watcher scripts);
+// if the main process sees nothing for HEARTBEAT_TIMEOUT it force-kills and
+// restarts.
 const HEARTBEAT_TIMEOUT = 90 * 1000;
 const watcherHeartbeats = new Map(); // label -> last-heard ms
 const watcherTimers = new Map(); // label -> heartbeat watchdog timer
@@ -682,7 +693,8 @@ function openTerminal() {
     try {
       const ps = "Set-Location -LiteralPath '" + dir.replace(/'/g, "''") + "'";
       const encoded = Buffer.from(ps, 'utf16le').toString('base64');
-      spawn('powershell.exe', ['-NoExit', '-EncodedCommand', encoded], { windowsHide: true, stdio: 'ignore' });
+      const pw = spawn('powershell.exe', ['-NoExit', '-EncodedCommand', encoded], { windowsHide: true, stdio: 'ignore' });
+      pw.on('error', (e) => log('open terminal: powershell failed: ' + e.message));
     } catch (e) { log('open terminal failed: ' + e.message); }
   });
 }
@@ -706,7 +718,7 @@ function startMuxWatcher(wsUrl) {
   // changed — otherwise a duplicate spawn would pile up mux processes.
   if (muxProc && !muxProc.killed && muxUrl === wsUrl) return;
   if (muxProc && !muxProc.killed) {
-    try { muxProc.kill(); } catch (e) { /* ignore */ }
+    try { muxProc.kill(); } catch { /* ignore */ }
   }
   muxUrl = wsUrl;
   const nodeExe = findNodeExe();
@@ -826,7 +838,9 @@ function buildTrayMenu() {
 function createTray() {
   const img = loadTrayIcon();
   tray = new Tray(img || nativeImage.createEmpty());
-  tray.setToolTip(PRODUCT_NAME);
+  // Apply any tooltip staged during boot (before the tray existed).
+  tray.setToolTip(pendingTooltip || PRODUCT_NAME);
+  pendingTooltip = null;
   tray.setContextMenu(buildTrayMenu());
   tray.on('click', () => showWindow());
 }
@@ -844,6 +858,7 @@ function showAbout() {
       'Shell data: ' + DATA_DIR + '\n' +
       'DSH home (shared with dev web profile): ' + DSH_HOME + '\n' +
       'URL: ' + dshUrl + '\n' +
+      'Service: ' + (ownsDsh ? '由本壳启动' : '复用外部 dsh') + '\n' +
       'Runtime: system node + dsh (no bundled runtime)\n\n' +
       'Notifications (task finished / approval / question) via built-in watchers.',
   });
@@ -1120,13 +1135,24 @@ function watchExternalDsh() {
       defaultId: 0,
     });
     if (choice === 0) {
+      // Race: between the health probe and this click the external dsh may
+      // have restarted and reclaimed its port. Re-check before spawning —
+      // otherwise we would start a second dsh on the same ~/.dsh.
+      let revived = false;
+      probeDsh(ok => { revived = ok; });
+      await new Promise(r => setTimeout(r, 1600));
+      if (revived) {
+        log('external dsh revived before takeover — reloading window instead');
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
+        return;
+      }
       ownsDsh = false;
       const portArg = await resolvePortArg();
       startDsh(portArg);
       waitForDsh(ok => {
         if (ok) {
           if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
-          if (tray) tray.setToolTip(PRODUCT_NAME + ' — 本壳启动 dsh');
+          setTrayTooltip(PRODUCT_NAME + ' — 本壳启动 dsh');
         } else {
           log('takeover start timed out');
         }
@@ -1144,12 +1170,26 @@ function watchExternalDsh() {
         dshUrl = foundUrl;
         ownsDsh = false; // external service: Restart must not spawn a second dsh
         log('reusing existing dsh at ' + dshUrl);
-        if (tray) tray.setToolTip(PRODUCT_NAME + ' — 外部 dsh (端口 ' + new URL(dshUrl).port + ')');
+        setTrayTooltip(PRODUCT_NAME + ' — 外部 dsh (端口 ' + new URL(dshUrl).port + ')');
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
         watchExternalDsh();
       } else {
         const portArg = await resolvePortArg();
-        if (!startDsh(portArg)) {
+        if (!startDsh(portArg, (err) => {
+          // Spawn succeeded at call time but the process errored right after
+          // (e.g. node.exe exists but fails to launch): fail fast instead of
+          // waiting out the 40s generic timeout.
+          log('dsh spawn failed asynchronously: ' + err.message);
+          dialog.showMessageBox({
+            type: 'warning',
+            title: APP_NAME,
+            message: 'DSH 服务启动失败',
+            detail: '系统 node 或 dsh 无法启动：' + err.message + '\n\n' +
+              '请确认已安装：npm install -g @deepseek-ai/dsh\n' +
+              '（需要 Node.js ≥ 22.15）\n\n日志目录：' + LOG_DIR,
+            buttons: ['OK'],
+          });
+        })) {
           // Nothing was spawned (missing node/dsh): fail fast with an
           // actionable message instead of a 40s generic timeout.
           log('startDsh returned null — nothing spawned');

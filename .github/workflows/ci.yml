@@ -13,7 +13,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+      # npm install (not ci): the local lock may lag devDependency changes;
+      # install resolves and CI validates with the committed package.json.
       - run: npm install
       # Syntax check every script (node --check catches parse errors but NOT
       # undefined-variable bugs — the ESLint step below covers those).
