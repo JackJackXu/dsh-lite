@@ -17,7 +17,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
-const net = require('net');
+const { readLastPort, savePort, portFree } = require('./scripts/port-utils.js');
 
 // Full product name (window title, tray tooltip, About). The short name is
 // used where space is tight (notifications, log lines).
@@ -86,6 +86,11 @@ let dshProc = null;
 // dsh (dev webui, another shell). Guards Restart: we must not spawn a second
 // dsh writing the same ~/.dsh when we don't own the current one.
 let ownsDsh = false;
+// Latch: "this start attempt already failed (sync or async)". The 40s
+// waitForDsh timeout must not stack a second dialog + a dead-URL window on
+// top of the failure dialog that already told the user. Reset before every
+// start attempt (main start, takeover, restart).
+let spawnFailed = false;
 let watcherProc = null;
 let lastCwd = null;
 let muxProc = null;
@@ -277,7 +282,7 @@ function findExistingDsh(cb) {
   const ports = [...new Set([
     Number(process.env.DSH_DLE_PORT) || 0,
     FALLBACK_PORT,
-    readLastPort(),
+    readLastPort(PORT_FILE),
     3080, // dev webui default
   ].filter(p => p > 0))];
   let i = 0;
@@ -342,38 +347,9 @@ function dshWebLog(data) {
 // (localStorage preferences like session grouping survive restarts).
 const PORT_FILE = path.join(DATA_DIR, 'port.txt');
 
-function readLastPort() {
-  try {
-    const p = Number(fs.readFileSync(PORT_FILE, 'utf8').trim());
-    // Range-guard: an invalid/corrupt port.txt (Infinity, 0, >65535) must not
-    // reach net.connect (it throws RangeError synchronously).
-    return Number.isInteger(p) && p > 0 && p < 65536 ? p : 0;
-  } catch { return 0; }
-}
-
-function savePort(port) {
-  try { fs.writeFileSync(PORT_FILE, String(port)); } catch { /* ignore */ }
-}
-
-// Port probe with an explicit three-way result:
-//   false -> busy (something answered on the port)
-//   true  -> free (connection refused / no listener)
-//   null  -> unknown (timeout) — retry before trusting it, a firewall or a
-//            half-open connection can make connect hang and "free" is wrong.
-function portFree(port) {
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = v => { if (!settled) { settled = true; socket.destroy(); resolve(v); } };
-    const socket = net.connect({ port, host: '127.0.0.1' });
-    socket.on('connect', () => finish(false));
-    socket.on('error', () => finish(true));
-    socket.setTimeout(800, () => finish(null));
-  });
-}
-
 // Decide the port argument: reuse lastPort when free, else let the OS pick.
 async function resolvePortArg() {
-  const lastPort = readLastPort();
+  const lastPort = readLastPort(PORT_FILE);
   if (lastPort > 0) {
     // Unknown (timeout) → retry once before giving up on the last port; the
     // timeout case is rare and usually transient.
@@ -386,6 +362,46 @@ async function resolvePortArg() {
     log('port ' + lastPort + (state === false ? ' busy' : ' unknown') + ' — falling back to random port');
   }
   return '0';
+}
+
+// Startup failure dialogs, shared by the main-start, takeover and restart
+// paths. The failure dialog is THE user signal; the waitForDsh 40s timeout
+// must not add a second dialog (or a dead-URL window) afterwards — see the
+// spawnFailed latch at the call sites.
+function showSpawnNotFound() {
+  dialog.showMessageBox({
+    type: 'warning',
+    title: APP_NAME,
+    message: '无法启动 DSH 服务',
+    detail: '未找到系统 node 或 dsh。请先安装：\n' +
+      '  npm install -g @deepseek-ai/dsh\n' +
+      '（需要 Node.js ≥ 22.15）\n\n' +
+      '日志目录：' + LOG_DIR,
+    buttons: ['OK'],
+  });
+}
+
+function showSpawnError(err) {
+  dialog.showMessageBox({
+    type: 'warning',
+    title: APP_NAME,
+    message: 'DSH 服务启动失败',
+    detail: '系统 node 或 dsh 无法启动：' + err.message + '\n\n' +
+      '请确认已安装：npm install -g @deepseek-ai/dsh\n' +
+      '（需要 Node.js ≥ 22.15）\n\n日志目录：' + LOG_DIR,
+    buttons: ['OK'],
+  });
+}
+
+function showStartupTimeout() {
+  dialog.showMessageBox({
+    type: 'warning',
+    title: APP_NAME,
+    message: 'DSH 服务启动超时',
+    detail: '请确认系统已安装 dsh（npm install -g @deepseek-ai/dsh），\n' +
+      '或查看日志：' + LOG_DIR,
+    buttons: ['OK'],
+  });
 }
 
 function startDsh(portArg, onSpawnError) {
@@ -436,7 +452,7 @@ function startDsh(portArg, onSpawnError) {
         dshUrl = m[1];
         try {
           const port = Number(new URL(dshUrl).port);
-          if (port > 0) savePort(port);
+          if (port > 0) savePort(PORT_FILE, port);
         } catch { /* ignore */ }
         log('resolved dsh url: ' + dshUrl);
         setTrayTooltip(PRODUCT_NAME + ' — 本壳启动 dsh');
@@ -517,7 +533,12 @@ function restartDsh() {
   stopDsh(() => {
     setTimeout(async () => {
       const portArg = await resolvePortArg();
-      startDsh(portArg);
+      spawnFailed = false;
+      startDsh(portArg, (err) => {
+        spawnFailed = true;
+        log('restart spawn failed: ' + err.message);
+        showSpawnError(err);
+      });
       waitForDsh(ok => {
         isRestarting = false;
         setTrayTooltip(PRODUCT_NAME);
@@ -1126,7 +1147,9 @@ function watchExternalDsh() {
     clearInterval(externalWatchTimer);
     externalWatchTimer = null;
     log('external dsh at ' + dshUrl + ' died — offering takeover');
-    const choice = dialog.showMessageBoxSync({
+    // Async variant: showMessageBoxSync would block the main process for the
+    // whole time the dialog is open (heartbeats, watcher supervision, mux).
+    const { response } = await dialog.showMessageBox({
       type: 'warning',
       title: APP_NAME,
       message: '外部 DSH 服务已停止',
@@ -1134,7 +1157,7 @@ function watchExternalDsh() {
       buttons: ['接管启动', '取消'],
       defaultId: 0,
     });
-    if (choice === 0) {
+    if (response === 0) {
       // Race: between the health probe and this click the external dsh may
       // have restarted and reclaimed its port. Re-check before spawning —
       // otherwise we would start a second dsh on the same ~/.dsh.
@@ -1146,9 +1169,16 @@ function watchExternalDsh() {
         if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
         return;
       }
-      ownsDsh = false;
+      // startDsh sets ownsDsh = true itself; do not pre-clear it here.
       const portArg = await resolvePortArg();
-      startDsh(portArg);
+      spawnFailed = false;
+      startDsh(portArg, (err) => {
+        // Takeover failed to spawn: fail fast with the same dialog as the
+        // main start path instead of a silent 40s wait.
+        spawnFailed = true;
+        log('takeover spawn failed: ' + err.message);
+        showSpawnError(err);
+      });
       waitForDsh(ok => {
         if (ok) {
           if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
@@ -1175,49 +1205,33 @@ function watchExternalDsh() {
         watchExternalDsh();
       } else {
         const portArg = await resolvePortArg();
+        spawnFailed = false;
         if (!startDsh(portArg, (err) => {
           // Spawn succeeded at call time but the process errored right after
           // (e.g. node.exe exists but fails to launch): fail fast instead of
           // waiting out the 40s generic timeout.
+          spawnFailed = true;
           log('dsh spawn failed asynchronously: ' + err.message);
-          dialog.showMessageBox({
-            type: 'warning',
-            title: APP_NAME,
-            message: 'DSH 服务启动失败',
-            detail: '系统 node 或 dsh 无法启动：' + err.message + '\n\n' +
-              '请确认已安装：npm install -g @deepseek-ai/dsh\n' +
-              '（需要 Node.js ≥ 22.15）\n\n日志目录：' + LOG_DIR,
-            buttons: ['OK'],
-          });
+          showSpawnError(err);
         })) {
           // Nothing was spawned (missing node/dsh): fail fast with an
           // actionable message instead of a 40s generic timeout.
+          spawnFailed = true;
           log('startDsh returned null — nothing spawned');
-          dialog.showMessageBox({
-            type: 'warning',
-            title: APP_NAME,
-            message: '无法启动 DSH 服务',
-            detail: '未找到系统 node 或 dsh。请先安装：\n' +
-              '  npm install -g @deepseek-ai/dsh\n' +
-              '（需要 Node.js ≥ 22.15）\n\n' +
-              '日志目录：' + LOG_DIR,
-            buttons: ['OK'],
-          });
+          showSpawnNotFound();
         }
       }
       waitForDsh(ready => {
         if (!ready) {
+          if (spawnFailed) {
+            // The failure dialog already told the user; never stack the 40s
+            // timeout dialog on top, and never open a window at a dead URL.
+            log('start already failed — skipping timeout dialog and window');
+            return;
+          }
           log('DSH service start timeout');
-          // Never leave a blank window: tell the user what happened and how
-          // to fix it instead of silently loading a dead URL.
-          dialog.showMessageBox({
-            type: 'warning',
-            title: APP_NAME,
-            message: 'DSH 服务启动超时',
-            detail: '请确认系统已安装 dsh（npm install -g @deepseek-ai/dsh），\n' +
-              '或查看日志：' + LOG_DIR,
-            buttons: ['OK'],
-          });
+          showStartupTimeout();
+          return; // no blank window pointing at a dead URL
         }
         createWindow();
         createTray();

@@ -8,12 +8,13 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win",
-    "test": "node --check main.js && node --check scripts/session-watcher.js && node --check scripts/mux-watcher.js && node --check scripts/icon-utils.js && node --check scripts/generate-whale-icon.js && node --check scripts/make-icon-from-png.js && node --check scripts/sprite-to-png.js"
+    "test": "node --check main.js && node --check scripts/session-watcher.js && node --check scripts/mux-watcher.js && node --check scripts/icon-utils.js && node --check scripts/generate-whale-icon.js && node --check scripts/make-icon-from-png.js && node --check scripts/sprite-to-png.js && node --check scripts/port-utils.js && node tests/port-utils.test.js && node tests/session-watcher.test.js"
   },
   "devDependencies": {
     "electron": "^41.0.0",
     "electron-builder": "^26.0.0",
-    "eslint": "^9.0.0"
+    "eslint": "^9.0.0",
+    "globals": "^14.0.0"
   },
   "build": {
     "appId": "com.deepseek.dshdle",
@@ -37,6 +38,10 @@
       {
         "from": "scripts/mux-watcher.js",
         "to": "scripts/mux-watcher.js"
+      },
+      {
+        "from": "scripts/port-utils.js",
+        "to": "scripts/port-utils.js"
       }
     ],
     "directories": {
