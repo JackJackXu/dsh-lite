@@ -4,6 +4,8 @@ node_modules/
 release/
 dist/
 out/
+# 与 icon.png 内容相同的中间产物（generate-whale-icon.js 每次生成）
+assets/whale-pixel.png
 
 # --- 日志与临时文件 ---
 *.log

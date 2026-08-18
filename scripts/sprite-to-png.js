@@ -2,17 +2,17 @@
 
 // Generate a 320x320 (16x16 grid, 20px cells) PNG from the whale SPRITE text,
 // so the app icon and the skin whale always come from the same source.
+// Pure Node (no sharp): nearest-neighbour scale + built-in PNG encoder.
 // Usage: node scripts/sprite-to-png.js
 // Outputs: assets/whale-source.png (then run make-icon-from-png.js on it)
 
 const path = require('node:path');
 const fs = require('node:fs');
-const { loadSharp } = require('./icon-utils.js');
-
-const sharp = loadSharp();
+const { encodePng, scaleNearest } = require('./icon-utils.js');
 
 // Same sprite as the skin plugin (whale.ts), typed by the user:
-// K=black, B=blue, L=light blue, .=transparent.
+// K=black outline/water, B=bright blue body, L=light belly, W=white mouth,
+// '.': solid white background (the whale is a white tile in both themes).
 const SPRITE = [
   '..K...K.........',
   '.K.K.K.K........',
@@ -43,6 +43,7 @@ const PALETTE = {
   B: [0, 0, 255],
   L: [153, 202, 255],
   W: [255, 255, 255],
+  '.': [255, 255, 255], // transparent -> solid white tile (matches skin whale.ts)
 }
 
 const N = SPRITE.length
@@ -56,19 +57,11 @@ for (let y = 0; y < N; y++) {
     if (c) {
       raw[o] = c[0]; raw[o + 1] = c[1]; raw[o + 2] = c[2]; raw[o + 3] = 255
     } else {
-      raw[o + 3] = 0
+      raw[o + 3] = 0 // unknown glyph: transparent (should never happen)
     }
   }
 }
 
-async function main() {
-  const png = await sharp(raw, { raw: { width: N, height: N, channels: 4 } })
-    .resize(N * CELL, N * CELL, { kernel: 'nearest' })
-    .png()
-    .toBuffer()
-  const out = path.join(__dirname, '..', 'assets', 'whale-source.png')
-  fs.writeFileSync(out, png)
-  console.log('[ok] wrote ' + out + ' (' + (N * CELL) + 'x' + (N * CELL) + ')')
-}
-
-main().catch(e => { console.error('failed: ' + e.message); process.exit(1) })
+const out = path.join(__dirname, '..', 'assets', 'whale-source.png')
+fs.writeFileSync(out, encodePng(scaleNearest(raw, N, N, N * CELL, N * CELL), N * CELL, N * CELL))
+console.log('[ok] wrote ' + out + ' (' + (N * CELL) + 'x' + (N * CELL) + ')')

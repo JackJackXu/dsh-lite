@@ -1,107 +1,72 @@
 'use strict';
 
-// Generate the DSH DLE app icons from the pixel whale sprite
-// (mist-blue palette, from the dsh-terminal-skin plugin).
+// Generate the DSH DLE app icons from the pixel whale sprite.
+// The whale is the SAME 16x16 sprite as the skin plugin (whale.ts) — the old
+// 32x32 sprite was a replacement and is gone (the user's original is 16x16).
 // Outputs:
 //   assets/icon.ico        — multi-size ICO (16/32/48/64/128/256), packaged icon
 //   assets/icon.png        — 256px PNG (window/tray icon)
 //   assets/whale-pixel.png — 256px PNG source
 //
-// Run with a Node that can load sharp.
+// Pure Node (no sharp): nearest-neighbour scale + built-in PNG/ICO encoders.
 // Usage: node scripts/generate-whale-icon.js
 
 const path = require('node:path');
 const fs = require('node:fs');
-const { loadSharp } = require('./icon-utils.js');
+const { encodePng, icoBmpEntry, scaleNearest } = require('./icon-utils.js');
 
-const sharp = loadSharp();
-
+// Same sprite as the skin plugin (whale.ts), typed by the user:
+// K=black outline/water, B=bright blue body, L=light belly, W=white mouth,
+// '.': solid white background (white tile in both themes, matches the skin).
 const SPRITE = [
-  '................................',
-  '................................',
-  '.............DDDDDD............',
-  '...........DDBBBBBBD...........',
-  '..........DBBBBBBBBBBD.........',
-  '.........DBBBBBBBBBBBBD........',
-  '........DBBBBBBBBBBBBBBD.......',
-  '........DBBBBBBBBBBBBBBD.......',
-  '.......DBBBWWWWWWWWWWBBBBD.....',
-  '.......DBBWWWWWWWWWWWWBBBBD....',
-  '.......DBWLLLLLWWWWWWWWBBBDD...',
-  '.......DBWLLLLLLWWWWWWWBBBD....',
-  '.......DBBLLLLLLLWWWWWWBBBBD...',
-  '........DBBLLLLLLWWWWWBBBBD....',
-  '........DBBBBLLLLLWWWWBBBBD....',
-  '.........DBBBBBBBBBBBBBBBBD....',
-  '..........DBBBBBBBBBBBBBBD.....',
-  '..........DBBBBBBBBBBBBBBD.....',
-  '..........DDBBBBBBBBBBBBBD.....',
-  '.........DBBBBBBBBBBBBBBD......',
-  '.......DBBBBDDDDBBBBBBD........',
-  '......DBBBBD....DBBBBD.........',
-  '.....DBBBBD......DBBBBD........',
-  '....DBBBBD........DBBBD........',
-  '...DBBBBD..........DBBD........',
-  '...DBBBD...........DBD.........',
-  '...DBBD.............DD.........',
-  '................................',
-  '................................',
-  '................................',
-  '................................',
-  '................................',
-];
+  '..K...K.........',
+  '.K.K.K.K........',
+  '....K.....K...K.',
+  '.........KBK.KBK',
+  '....K....KBBKBBK',
+  '..........KBBBK.',
+  '..KKKKKK...KBBK.',
+  '.KBBBBBBK..KBBK.',
+  'KBBBBBBBBKKBBBBK',
+  'KBKBBBKBBBBBBBBK',
+  'KBKBBBKBBBBBBBBK',
+  'KBBBBBBBBBBBBBBK',
+  'KB.....BBBBKBBK.',
+  'KL......LKBBKBK.',
+  '.KLLLLLLLKKBBK..',
+  '..KKKKKKK..KK...',
+]
 
-const PALETTE = { D: '#142660', B: '#4E6FFF', L: '#BEE1FF', W: '#FFFFFF' };
-
-const W = SPRITE[0].length;
-const H = SPRITE.length;
-
-// Defensive normalization: every row must be exactly W wide (pad/trim).
-const GRID = SPRITE.map(r => r.padEnd(W, '.').slice(0, W));
-
-function hexToRgb(hex) {
-  return [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
+// Every row must be exactly 16 cells.
+for (const row of SPRITE) {
+  if (row.length !== 16) throw new Error('sprite row length ' + row.length + ' != 16: "' + row + '"')
 }
 
-// RGBA raw buffer (W x H), transparent background
-const raw = Buffer.alloc(W * H * 4);
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const ch = GRID[y][x];
-    const o = (y * W + x) * 4;
-    if (PALETTE[ch]) {
-      const [r, g, b] = hexToRgb(PALETTE[ch]);
-      raw[o] = r; raw[o + 1] = g; raw[o + 2] = b; raw[o + 3] = 255;
+const PALETTE = {
+  K: [0, 0, 0],
+  B: [0, 0, 255],
+  L: [153, 202, 255],
+  W: [255, 255, 255],
+  '.': [255, 255, 255], // transparent -> solid white tile
+}
+
+const N = SPRITE.length
+const raw = Buffer.alloc(N * N * 4)
+for (let y = 0; y < N; y++) {
+  for (let x = 0; x < N; x++) {
+    const ch = SPRITE[y][x]
+    const o = (y * N + x) * 4
+    const c = PALETTE[ch]
+    if (c) {
+      raw[o] = c[0]; raw[o + 1] = c[1]; raw[o + 2] = c[2]; raw[o + 3] = 255
     } else {
-      raw[o + 3] = 0;
+      raw[o + 3] = 0 // unknown glyph: transparent (should never happen)
     }
   }
 }
 
-async function renderPng(size) {
-  return sharp(raw, { raw: { width: W, height: H, channels: 4 } })
-    .resize(size, size, { fit: 'contain', kernel: 'nearest', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-    .png()
-    .toBuffer();
-}
-
-// ICO container with embedded PNG entries (Vista+ supports PNG-compressed icons).
-// Classic ICO with BMP-encoded entries (NSIS-compatible; PNG entries inside
-// ICO are rejected by makensis with "invalid icon file size").
-async function renderIcoEntry(size) {
-  const bmp = await sharp(raw, { raw: { width: W, height: H, channels: 4 } })
-    .resize(size, size, { kernel: 'nearest' })
-    .bmp()
-    .toBuffer();
-  const dib = Buffer.from(bmp.subarray(14, 54));
-  dib.writeInt32LE(size * 2, 8); // biHeight includes the AND mask
-  const xorRows = bmp.subarray(54);
-  const andMask = Buffer.alloc(Math.ceil(size / 8) * size);
-  return Buffer.concat([dib, xorRows, andMask]);
-}
-
 // Classic ICO with BMP-encoded entries. Layout: ICONDIR + ALL ICONDIRENTRYs
-// first, then all image data.
+// first, then all image data. NSIS-compatible (no PNG entries).
 function buildIco(entries) {
   const count = entries.length;
   const header = Buffer.alloc(6);
@@ -128,18 +93,17 @@ function buildIco(entries) {
   return Buffer.concat([header, ...entryBufs, ...dataBufs]);
 }
 
-(async () => {
-  const root = path.resolve(__dirname, '..');
-  const sizes = [16, 32, 48, 64, 128, 256];
-  const icoEntries = [];
-  const pngEntries = [];
-  for (const s of sizes) {
-    icoEntries.push({ size: s, data: await renderIcoEntry(s) });
-    pngEntries.push({ size: s, png: await renderPng(s) });
-  }
+const root = path.resolve(__dirname, '..');
+const sizes = [16, 32, 48, 64, 128, 256];
+const icoEntries = [];
+const pngEntries = [];
+for (const s of sizes) {
+  const scaled = scaleNearest(raw, N, N, s, s);
+  icoEntries.push({ size: s, data: icoBmpEntry(scaled, s, s) });
+  pngEntries.push({ size: s, png: encodePng(scaled, s, s) });
+}
 
-  fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(icoEntries));
-  fs.writeFileSync(path.join(root, 'assets', 'icon.png'), pngEntries[pngEntries.length - 1].png);
-  fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), pngEntries[pngEntries.length - 1].png);
-  console.log('icons written: assets/icon.ico (BMP entries, ' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
-})().catch(e => { console.error('icon generation failed: ' + e.message); process.exit(1); });
+fs.writeFileSync(path.join(root, 'assets', 'icon.ico'), buildIco(icoEntries));
+fs.writeFileSync(path.join(root, 'assets', 'icon.png'), pngEntries[pngEntries.length - 1].png);
+fs.writeFileSync(path.join(root, 'assets', 'whale-pixel.png'), pngEntries[pngEntries.length - 1].png);
+console.log('icons written: assets/icon.ico (BMP entries, ' + sizes.join('/') + '), assets/icon.png (256), assets/whale-pixel.png');
