@@ -276,9 +276,15 @@ if (require.main === module) {
     sessionsDir,
     onTurnEnd: (m) => process.stdout.write(JSON.stringify({ event: 'turnEnd', ...m }) + '\n'),
     onSession: (m) => process.stdout.write(JSON.stringify({ event: 'session', ...m }) + '\n'),
-    log: () => {},
+    // Internal errors go to stderr as JSON lines so the supervising shell can
+    // wire them into its own log (previously swallowed by a no-op logger).
+    log: (scope, msg) => process.stderr.write(JSON.stringify({ event: 'error', scope, message: msg }) + '\n'),
   });
   watcher.start(2000);
+
+  // Heartbeat: proves liveness to the supervising shell. The shell force-
+  // restarts us if nothing (heartbeat or a real event) arrives for 90s.
+  setInterval(() => process.stdout.write(JSON.stringify({ event: 'heartbeat' }) + '\n'), 30 * 1000).unref();
 
   process.on('SIGTERM', () => { watcher.stop(); process.exit(0); });
   process.on('SIGINT', () => { watcher.stop(); process.exit(0); });

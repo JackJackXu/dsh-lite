@@ -372,13 +372,11 @@ function startDsh(portArg) {
   log('starting dsh web via system node: ' + nodeExe + ' (--port ' + portArg + ')');
   const env = Object.assign({}, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
-  // DSH_HOME is intentionally NOT honored: the shell and the spawned dsh must
-  // agree on the shared home (~/.dsh, the dev-web profile's data). If the
-  // user's environment sets DSH_HOME elsewhere, the spawned dsh would inherit
-  // it and diverge from what the watchers read — so pin it to the same value.
+  // Pin DSH_HOME to the shared ~/.dsh: the shell's watchers read that exact
+  // directory, so the spawned dsh must use it too. If the user's environment
+  // set DSH_HOME elsewhere, the child would inherit it and diverge — pinning
+  // keeps shell and service on the same data (API key, sessions, skins).
   env.DSH_HOME = DSH_HOME;
-  // No DSH_HOME override: share ~/.dsh with the dev web profile (API key,
-  // sessions, plugins, skins). The spawned process inherits the user's PATH.
   fs.mkdirSync(DATA_DIR, { recursive: true });
   // Capture stdout to parse the announced port and to persist dsh-web.log.
   const proc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
@@ -411,6 +409,7 @@ function startDsh(portArg) {
           if (port > 0) savePort(port);
         } catch { /* ignore */ }
         log('resolved dsh url: ' + dshUrl);
+        if (tray) tray.setToolTip(PRODUCT_NAME + ' — 本壳启动 dsh');
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
       }
     }
@@ -501,13 +500,50 @@ function restartDsh() {
 // Notifications are the shell's core feature; if a watcher dies (crash, dsh
 // API change, transient OS error) it must come back on its own instead of
 // silently killing the notifications. A generic supervisor wraps any
-// restartable child: exponential backoff up to a cap, and NO restart when the
+// restartable child: exponential backoff up to a cap, NO restart when the
 // shell is quitting or the watcher was killed on purpose.
 const WATCHER_MAX_RESTARTS = 5;
 const watcherRestarts = new Map(); // label -> count
 
+// Heartbeat: a watcher that is alive but hung (never exits, never emits)
+// would otherwise slip past the exit-based supervision forever. Each watcher
+// prints {"event":"heartbeat"} every HEARTBEAT_INTERVAL; if the main process
+// sees nothing for HEARTBEAT_TIMEOUT it force-kills and restarts.
+const HEARTBEAT_INTERVAL = 30 * 1000;
+const HEARTBEAT_TIMEOUT = 90 * 1000;
+const watcherHeartbeats = new Map(); // label -> last-heard ms
+const watcherTimers = new Map(); // label -> heartbeat watchdog timer
+
+function watchHeartbeat(label, proc) {
+  watcherHeartbeats.set(label, Date.now());
+  const arm = () => {
+    const t = setTimeout(() => {
+      const last = watcherHeartbeats.get(label) || 0;
+      if (Date.now() - last > HEARTBEAT_TIMEOUT) {
+        log(label + ' watcher heartbeat timeout — force restarting');
+        try { proc.kill(); } catch { /* already dead */ }
+        // The exit handler drives the supervised restart.
+      } else {
+        arm();
+      }
+    }, HEARTBEAT_TIMEOUT);
+    watcherTimers.set(label, t);
+  };
+  arm();
+  return () => { const t = watcherTimers.get(label); if (t) clearTimeout(t); };
+}
+
+// Call on ANY valid JSON line from a watcher: counts as liveness (resets the
+// restart budget) and refreshes the heartbeat.
+function watcherHealthy(label) {
+  watcherHeartbeats.set(label, Date.now());
+  watcherRestarts.delete(label);
+}
+
 function superviseWatcher(proc, label, restartFn) {
+  const stopHeartbeat = watchHeartbeat(label, proc);
   proc.on('exit', code => {
+    stopHeartbeat();
     // Stale-exit guard (the process may have been replaced already).
     if (label === 'session' && watcherProc !== proc) return;
     if (label === 'mux' && muxProc !== proc) return;
@@ -546,6 +582,10 @@ function startSessionWatcher() {
   });
   proc.on('error', err => log('session watcher spawn error: ' + err.message));
   watcherProc = proc;
+  // stderr: wire into the shell log so watcher-internal errors are diagnosable
+  // instead of vanishing (a watcher printing to stderr without a consumer can
+  // also hit backpressure and stall).
+  proc.stderr.on('data', buf => log('session-watcher stderr: ' + buf.toString().trim()));
   // Line-buffered stdout parsing: pipe chunks do NOT align to newlines, so a
   // JSON line split across two chunks would otherwise be dropped (a lost
   // notification). Accumulate until the newline, then parse whole lines.
@@ -559,6 +599,8 @@ function startSessionWatcher() {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
+        if (msg.event === 'heartbeat') { watcherHealthy('session'); continue; }
+        watcherHealthy('session');
         if (msg.event === 'turnEnd') {
           const body = msg.title ? '任务完成：「' + msg.title + '」' : '任务完成，点击查看详情';
           showNotification(APP_NAME, body);
@@ -657,6 +699,8 @@ function startMuxWatcher(wsUrl) {
       if (!line) continue;
       try {
         const msg = JSON.parse(line);
+        if (msg.event === 'heartbeat') { watcherHealthy('mux'); continue; }
+        watcherHealthy('mux');
         if (msg.event !== 'attention') continue;
         // Dedup: a mux reconnect replays still-pending approvals/questions,
         // so the same item can arrive repeatedly. Within a 10-minute window,
@@ -957,23 +1001,26 @@ function installWakeRecovery() {
 // a dialog (without force-quitting: the crash-recovery already rebuilds the
 // window, and the user can restart from the tray).
 let uncaughtStreak = 0;
-process.on('uncaughtException', (err) => {
-  try { log('uncaughtException: ' + (err && err.stack || err)); } catch { /* ignore */ }
+// Shared accounting for uncaught exceptions AND unhandled rejections: log
+// always; after 3 in a row show a dialog (without force-quitting — the
+// crash-recovery already rebuilds the window, the user can restart from tray).
+function noteMainError(kind, detail) {
+  try { log(kind + ': ' + detail); } catch { /* ignore */ }
   uncaughtStreak += 1;
-  if (uncaughtStreak >= 3) {
-    uncaughtStreak = 0;
-    try {
-      dialog.showMessageBox({
-        type: 'warning',
-        title: APP_NAME,
-        message: 'DSH DLE 主进程连续出错',
-        detail: '请从托盘菜单「重启服务」或退出后重新启动。详情见日志：' + LOG_DIR,
-        buttons: ['OK'],
-      });
-    } catch { /* dialog unavailable */ }
-  }
-});
-process.on('unhandledRejection', (reason) => { try { log('unhandledRejection: ' + (reason instanceof Error ? reason.stack : String(reason))); } catch { /* ignore */ } });
+  if (uncaughtStreak < 3) return;
+  uncaughtStreak = 0;
+  try {
+    dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: 'DSH DLE 主进程连续出错',
+      detail: '请从托盘菜单「重启服务」或退出后重新启动。详情见日志：' + LOG_DIR,
+      buttons: ['OK'],
+    });
+  } catch { /* dialog unavailable */ }
+}
+process.on('uncaughtException', (err) => noteMainError('uncaughtException', (err && err.stack || err)));
+process.on('unhandledRejection', (reason) => noteMainError('unhandledRejection', (reason instanceof Error ? reason.stack : String(reason))));
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -986,8 +1033,11 @@ if (!gotLock) {
     // may not appear or may be attributed to "Electron".
     if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
     loadSettings();
-    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-    log('boot: ' + APP_NAME + ' v' + pkg.version);
+    let bootVersion = '?';
+    try {
+      bootVersion = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '?';
+    } catch (e) { log('boot: package.json unreadable: ' + (e && e.message || e)); }
+    log('boot: ' + APP_NAME + ' v' + bootVersion);
     log('data dir: ' + DATA_DIR);
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     installSecurityHooks();
@@ -1012,10 +1062,25 @@ if (!gotLock) {
         dshUrl = foundUrl;
         ownsDsh = false; // external service: Restart must not spawn a second dsh
         log('reusing existing dsh at ' + dshUrl);
+        if (tray) tray.setToolTip(PRODUCT_NAME + ' — 外部 dsh (端口 ' + new URL(dshUrl).port + ')');
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
       } else {
         const portArg = await resolvePortArg();
-        startDsh(portArg);
+        if (!startDsh(portArg)) {
+          // Nothing was spawned (missing node/dsh): fail fast with an
+          // actionable message instead of a 40s generic timeout.
+          log('startDsh returned null — nothing spawned');
+          dialog.showMessageBox({
+            type: 'warning',
+            title: APP_NAME,
+            message: '无法启动 DSH 服务',
+            detail: '未找到系统 node 或 dsh。请先安装：\n' +
+              '  npm install -g @deepseek-ai/dsh\n' +
+              '（需要 Node.js ≥ 22.15）\n\n' +
+              '日志目录：' + LOG_DIR,
+            buttons: ['OK'],
+          });
+        }
       }
       waitForDsh(ready => {
         if (!ready) {

@@ -89,5 +89,9 @@ function scheduleReconnect() {
 
 connect();
 
+// Heartbeat: proves liveness to the supervising shell even while the
+// WebSocket is idle (no pending approvals/questions to report).
+setInterval(() => process.stdout.write(JSON.stringify({ event: 'heartbeat' }) + '\n'), 30 * 1000).unref();
+
 process.on('SIGTERM', () => { closing = true; if (ws) try { ws.close(); } catch {} process.exit(0); });
 process.on('SIGINT', () => { closing = true; if (ws) try { ws.close(); } catch {} process.exit(0); });
