@@ -79,6 +79,10 @@ function scriptsDir() {
 let mainWindow = null;
 let tray = null;
 let dshProc = null;
+// Does this shell own the running dsh process? false = reusing an external
+// dsh (dev webui, another shell). Guards Restart: we must not spawn a second
+// dsh writing the same ~/.dsh when we don't own the current one.
+let ownsDsh = false;
 let watcherProc = null;
 let lastCwd = null;
 let muxProc = null;
@@ -168,23 +172,25 @@ function findNodeExe() {
   return null;
 }
 
-// The session watcher needs Node >= 22 (node:zlib zstd decompression) and the
-// mux watcher needs a global WebSocket (also Node >= 22). On an older system
-// node the notifications would silently never work, so verify the version once
-// at boot and surface a clear warning instead.
-const NODE_MIN_MAJOR = 22;
+// The session watcher needs node:zlib zstd decompression and the mux watcher
+// needs a global WebSocket. Version numbers are unreliable (zstd landed in
+// 22.15, not 22.0), so probe the actual features once at boot instead of
+// comparing a major version, and surface a clear warning when they're missing.
 function checkNodeVersion(nodeExe) {
   return new Promise(resolve => {
     try {
-      const proc = spawn(nodeExe, ['-p', 'process.versions.node'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      // Prints "ok" only when BOTH features exist; anything else means missing.
+      const probe = "process.stdout.write(typeof require('node:zlib').zstdDecompressSync === 'function' && typeof WebSocket === 'function' ? 'ok' : 'missing')";
+      const proc = spawn(nodeExe, ['-e', probe], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
+      let done = false;
+      const finish = result => { if (!done) { done = true; clearTimeout(timer); resolve(result); } };
       proc.stdout.on('data', buf => { out += buf.toString(); });
-      proc.on('error', () => resolve(null));
-      proc.on('exit', () => {
-        const m = /^v?(\d+)\./.exec(out.trim());
-        resolve(m ? Number(m[1]) : null);
-      });
-    } catch { resolve(null); }
+      proc.on('error', () => finish(false));
+      proc.on('exit', () => finish(out.trim() === 'ok'));
+      // Safety net: a hung node must not block startup forever.
+      const timer = setTimeout(() => { try { proc.kill(); } catch { /* ignore */ } finish(false); }, 3000);
+    } catch { resolve(false); }
   });
 }
 
@@ -220,18 +226,22 @@ function findDshEntry() {
 
 /* ---------------- DSH service probe (health check) ---------------- */
 // Probe one URL: is a dsh web UI answering here? Timeout counts as "no".
+// No byte cap: the "id="root"" marker can legally sit past 2KB in a large
+// initial HTML, and truncating would mis-detect a LIVE dsh as absent (then
+// spawn a duplicate). Match incrementally and finish on the first hit.
 function probeUrl(url, cb) {
   let done = false;
   const once = result => {
     if (done) return;
     done = true;
+    req.destroy();
     cb(result);
   };
+  let body = '';
   const req = http.get(url, res => {
-    let body = '';
     res.on('data', c => {
       body += c;
-      if (body.length > 2000) req.destroy();
+      if (body.includes('id="root"') || body.includes('DeepSeek Harness')) once(true);
     });
     res.on('end', () => once(res.statusCode === 200 && (body.includes('id="root"') || body.includes('DeepSeek Harness'))));
     res.on('error', () => once(false));
@@ -378,7 +388,8 @@ function startDsh(portArg) {
     windowsHide: true,
   });
   dshProc = proc;
-  proc.on('error', err => log('dsh spawn error: ' + err.message));
+  ownsDsh = true;
+  proc.on('error', err => { log('dsh spawn error: ' + err.message); if (dshProc === proc) { dshProc = null; ownsDsh = false; } });
   // Line-buffered URL parsing: pipe chunks do not align to newlines, so the
   // "dsh web: http://…" line could be split across two chunks; parsing each
   // chunk alone would miss the URL (no port saved, no mux watcher, and a
@@ -409,7 +420,7 @@ function startDsh(portArg) {
     // Stale-exit guard: a restart kills the old process and spawns a new one;
     // the old process's async exit event must not null out the CURRENT
     // reference (or the new process would escape quitApp's tree kill).
-    if (dshProc === proc) dshProc = null;
+    if (dshProc === proc) { dshProc = null; ownsDsh = false; }
     log('dsh service exited, code=' + code);
     if (!isQuitting && !isRestarting && tray) {
       tray.displayBalloon({
@@ -429,9 +440,11 @@ function killTree(proc, cb) {
   if (!proc || !proc.pid) { if (cb) cb(); return; }
   const pid = proc.pid;
   let done = false;
+  let safetyTimer = null;
   const finish = () => {
     if (done) return;
     done = true;
+    if (safetyTimer) clearTimeout(safetyTimer);
     if (cb) cb();
   };
   try {
@@ -440,7 +453,7 @@ function killTree(proc, cb) {
     tk.on('error', () => { try { proc.kill(); } catch { /* already dead */ } finish(); });
     tk.on('exit', () => finish());
     // Safety net: taskkill exit can be missed if the process tree is weird.
-    setTimeout(finish, 3000);
+    safetyTimer = setTimeout(finish, 3000);
   } catch {
     try { proc.kill(); } catch { /* already dead */ }
     finish();
@@ -454,6 +467,18 @@ function stopDsh(cb) {
 
 function restartDsh() {
   if (isRestarting) return;
+  if (!ownsDsh) {
+    // Reusing an external dsh (dev webui / another shell): we must NOT spawn
+    // a second instance writing the same ~/.dsh. Just reload the page and
+    // tell the user the external service needs its own restart.
+    log('restart requested but dsh is external — reloading window only');
+    if (tray) tray.displayBalloon({
+      title: APP_NAME,
+      content: '当前正在使用外部 dsh 服务（非本壳启动）。已重新加载窗口；如需重启服务请在启动它的那个窗口操作。',
+    });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
+    return;
+  }
   isRestarting = true;
   if (tray) tray.setToolTip(PRODUCT_NAME + ' - restarting...');
   stopDsh(() => {
@@ -640,6 +665,13 @@ function startMuxWatcher(wsUrl) {
           ? 'a:' + (msg.toolName || '') + ':' + (msg.reason || '')
           : 'q:' + (msg.header || '') + ':' + (msg.question || '');
         const now = Date.now();
+        // Prune keys older than the dedup window (10 min) so the map does not
+        // grow unboundedly over months of uptime.
+        if (muxSeen.size > 200) {
+          for (const [k, t] of muxSeen) {
+            if (now - t > 10 * 60 * 1000) muxSeen.delete(k);
+          }
+        }
         if (muxSeen.has(key) && now - muxSeen.get(key) < 10 * 60 * 1000) continue;
         muxSeen.set(key, now);
         if (msg.kind === 'approval') {
@@ -818,10 +850,12 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadURL(dshUrl);
-  setupCrashRecovery(mainWindow);
+  const win = mainWindow;
 
-  mainWindow.on('close', e => {
+  win.loadURL(dshUrl);
+  setupCrashRecovery(win);
+
+  win.on('close', e => {
     // Tray app: closing hides instead of quitting (unless actually quitting).
     // Hide the closing window itself, not the module-level mainWindow — a
     // crash rebuild may have replaced it by the time a stale close fires.
@@ -830,10 +864,10 @@ function createWindow() {
   // Stale-close guard (same pattern as the subprocess exit handlers): a crash
   // rebuild destroys the old window and creates a new one; the old window's
   // async 'closed' event must not null out the NEW mainWindow reference.
-  mainWindow.on('closed', () => { if (mainWindow === win) mainWindow = null; });
+  win.on('closed', () => { if (mainWindow === win) mainWindow = null; });
   // Keep the window title stable: dsh pages rewrite document.title on load,
   // which would overwrite the product name in the title bar.
-  mainWindow.on('page-title-updated', e => e.preventDefault());
+  win.on('page-title-updated', e => e.preventDefault());
 }
 
 function showWindow() {
@@ -958,14 +992,17 @@ if (!gotLock) {
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     installSecurityHooks();
     installWakeRecovery();
-    // Node version gate: notifications need Node >= 22 (zstd + global
-    // WebSocket). Warn loudly instead of letting them fail silently.
+    // Node feature gate: the watchers need zstd (node:zlib) + global
+    // WebSocket. Probe the features, not the version number; when missing,
+    // SKIP the watchers entirely (no point running them silently broken) and
+    // say so plainly.
     const nodeExe = findNodeExe();
-    const nodeMajor = await checkNodeVersion(nodeExe);
-    if (nodeMajor !== null && nodeMajor < NODE_MIN_MAJOR) {
-      log('WARNING: system Node is v' + nodeMajor + ', watchers need v' + NODE_MIN_MAJOR + '+ — notifications disabled');
+    const nodeOk = await checkNodeVersion(nodeExe);
+    if (nodeOk) {
+      startSessionWatcher();
+    } else {
+      log('WARNING: system Node lacks zstd/WebSocket support — notifications disabled (update Node to 22.15+)');
     }
-    startSessionWatcher();
     findExistingDsh(async foundUrl => {
       if (foundUrl) {
         // Reusing an already-running dsh (dev webui on 3080, a previous shell,
@@ -973,6 +1010,7 @@ if (!gotLock) {
         // URL and start the mux watcher — otherwise approval/question
         // notifications would silently stay off.
         dshUrl = foundUrl;
+        ownsDsh = false; // external service: Restart must not spawn a second dsh
         log('reusing existing dsh at ' + dshUrl);
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
       } else {
