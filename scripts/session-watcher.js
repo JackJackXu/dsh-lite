@@ -131,7 +131,13 @@ class SessionWatcher {
   scan(maxChanged = Infinity) {
     let any = false;
     let changed = 0;
-    for (const file of this.listLogs()) {
+    const live = new Set(this.listLogs());
+    // Drop bookkeeping for sessions that no longer exist (deleted logs would
+    // otherwise keep their Map entries forever).
+    for (const key of this.files.keys()) {
+      if (!live.has(key)) this.files.delete(key);
+    }
+    for (const file of live) {
       try {
         const grew = this.process(file);
         if (grew) {

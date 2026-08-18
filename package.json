@@ -7,11 +7,13 @@
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win"
+    "dist": "electron-builder --win",
+    "test": "node --check main.js && node --check scripts/session-watcher.js && node --check scripts/mux-watcher.js && node --check scripts/icon-utils.js && node --check scripts/generate-whale-icon.js && node --check scripts/make-icon-from-png.js && node --check scripts/sprite-to-png.js"
   },
   "devDependencies": {
     "electron": "^41.0.0",
-    "electron-builder": "^26.0.0"
+    "electron-builder": "^26.0.0",
+    "eslint": "^9.0.0"
   },
   "build": {
     "appId": "com.deepseek.dshdle",

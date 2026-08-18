@@ -15,10 +15,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install
-      # Syntax + type safety + bundle rebuild must all stay green.
-      - run: node --check main.js
-      - run: node --check scripts/session-watcher.js
-      - run: node --check scripts/mux-watcher.js
-      - run: node --check scripts/generate-whale-icon.js
-      - run: node --check scripts/make-icon-from-png.js
-      - run: node --check scripts/sprite-to-png.js
+      # Syntax check every script (node --check catches parse errors but NOT
+      # undefined-variable bugs — the ESLint step below covers those).
+      - run: npm test
+      # Static analysis: `no-undef` catches exactly the class of bug that the
+      # createWindow `win` regression was (reference to an undeclared name).
+      - run: npx eslint main.js scripts/*.js

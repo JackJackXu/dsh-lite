@@ -87,6 +87,9 @@ let watcherProc = null;
 let lastCwd = null;
 let muxProc = null;
 let muxUrl = '';
+// Node feature gate result (set at boot): false means zstd/WebSocket missing,
+// so NO watcher may start (session OR mux) — they would fail and spam the log.
+let nodeOk = false;
 // Mux notification dedup: reconnect replays pending items; key -> last-seen ms.
 const muxSeen = new Map();
 let isQuitting = false;
@@ -151,7 +154,11 @@ function log(msg) {
     truncateIfLarge(LOG_FILE);
     ensureUtf8Bom(LOG_FILE);
     fs.appendFileSync(LOG_FILE, line + '\n');
-  } catch { /* log dir unavailable */ }
+  } catch {
+    // Write failed (e.g. the file was deleted externally between stat and
+    // append): drop the BOM cache so the next call re-verifies from scratch.
+    bomVerified.delete(LOG_FILE);
+  }
 }
 
 /* ---------------- system environment lookup ---------------- */
@@ -316,7 +323,9 @@ function dshWebLog(data) {
     truncateIfLarge(file);
     ensureUtf8Bom(file);
     fs.appendFileSync(file, data);
-  } catch { /* ignore */ }
+  } catch {
+    bomVerified.delete(path.join(LOG_DIR, 'dsh-web.log'));
+  }
 }
 
 // Port persistence: reuse the last used port so the web origin stays stable
@@ -324,7 +333,12 @@ function dshWebLog(data) {
 const PORT_FILE = path.join(DATA_DIR, 'port.txt');
 
 function readLastPort() {
-  try { return Number(fs.readFileSync(PORT_FILE, 'utf8').trim()); } catch { return 0; }
+  try {
+    const p = Number(fs.readFileSync(PORT_FILE, 'utf8').trim());
+    // Range-guard: an invalid/corrupt port.txt (Infinity, 0, >65535) must not
+    // reach net.connect (it throws RangeError synchronously).
+    return Number.isInteger(p) && p > 0 && p < 65536 ? p : 0;
+  } catch { return 0; }
 }
 
 function savePort(port) {
@@ -387,7 +401,12 @@ function startDsh(portArg) {
   });
   dshProc = proc;
   ownsDsh = true;
-  proc.on('error', err => { log('dsh spawn error: ' + err.message); if (dshProc === proc) { dshProc = null; ownsDsh = false; } });
+  proc.on('error', err => {
+    log('dsh spawn error: ' + err.message);
+    if (dshProc === proc) dshProc = null;
+    // ownsDsh stays true: a shell-started dsh that failed to spawn should
+    // still be retried by Restart, not mistaken for an external service.
+  });
   // Line-buffered URL parsing: pipe chunks do not align to newlines, so the
   // "dsh web: http://…" line could be split across two chunks; parsing each
   // chunk alone would miss the URL (no port saved, no mux watcher, and a
@@ -419,7 +438,11 @@ function startDsh(portArg) {
     // Stale-exit guard: a restart kills the old process and spawns a new one;
     // the old process's async exit event must not null out the CURRENT
     // reference (or the new process would escape quitApp's tree kill).
-    if (dshProc === proc) { dshProc = null; ownsDsh = false; }
+    // ownsDsh is NOT cleared here: this process was started by the shell, so
+    // Restart must keep trying to relaunch it even after a crash (clearing it
+    // would make Restart degrade to a page reload — the service could never
+    // come back). ownsDsh only flips to false in the external-reuse branch.
+    if (dshProc === proc) dshProc = null;
     log('dsh service exited, code=' + code);
     if (!isQuitting && !isRestarting && tray) {
       tray.displayBalloon({
@@ -580,7 +603,12 @@ function startSessionWatcher() {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  proc.on('error', err => log('session watcher spawn error: ' + err.message));
+  proc.on('error', err => {
+    log('session watcher spawn error: ' + err.message);
+    // Spawn failed synchronously — clear the reference now (the heartbeat
+    // watchdog would otherwise take 90s to notice a process that never lived).
+    if (watcherProc === proc) watcherProc = null;
+  });
   watcherProc = proc;
   // stderr: wire into the shell log so watcher-internal errors are diagnosable
   // instead of vanishing (a watcher printing to stderr without a consumer can
@@ -667,6 +695,11 @@ function openTerminal() {
 // and reports attention events over stdout:
 //   {"event":"attention","kind":"approval"|"question",...}
 function startMuxWatcher(wsUrl) {
+  // Node feature gate: same requirement as the session watcher (zstd +
+  // WebSocket). Skip silently when the gate failed at boot — spawning would
+  // only produce repeated errors and contradict the "notifications disabled"
+  // message.
+  if (!nodeOk) return;
   // Idempotence: the URL can be announced both from stdout parsing (when this
   // shell spawns dsh) and from the reuse branch (when an external dsh is
   // already running). Only (re)start when the watcher is dead or the URL
@@ -728,7 +761,12 @@ function startMuxWatcher(wsUrl) {
       } catch { /* partial/corrupt line */ }
     }
   });
-  proc.on('error', err => log('mux watcher spawn error: ' + err.message));
+  proc.on('error', err => {
+    log('mux watcher spawn error: ' + err.message);
+    // Spawn failed synchronously — clear the reference now (heartbeat watchdog
+    // would otherwise take 90s to notice a process that never lived).
+    if (muxProc === proc) muxProc = null;
+  });
   superviseWatcher(proc, 'mux', () => {
     if (muxUrl) startMuxWatcher(muxUrl);
   });
@@ -1047,12 +1085,56 @@ if (!gotLock) {
     // SKIP the watchers entirely (no point running them silently broken) and
     // say so plainly.
     const nodeExe = findNodeExe();
-    const nodeOk = await checkNodeVersion(nodeExe);
+    nodeOk = await checkNodeVersion(nodeExe);
     if (nodeOk) {
       startSessionWatcher();
     } else {
       log('WARNING: system Node lacks zstd/WebSocket support — notifications disabled (update Node to 22.15+)');
     }
+// Reused-external-dsh health watch: the external service is not owned by us,
+// so its death would leave the window on a dead page with no signal. Probe it
+// every 30s; when it stops answering AND the port is free, tell the user and
+// offer to take over (spawn our own dsh).
+let externalWatchTimer = null;
+function watchExternalDsh() {
+  if (externalWatchTimer) clearInterval(externalWatchTimer);
+  externalWatchTimer = setInterval(async () => {
+    if (ownsDsh || isQuitting) { clearInterval(externalWatchTimer); externalWatchTimer = null; return; }
+    let alive = false;
+    probeDsh(ok => { alive = ok; });
+    // Give the probe a moment to settle, then decide.
+    await new Promise(r => setTimeout(r, 1600));
+    if (alive) return;
+    const port = (() => { try { return Number(new URL(dshUrl).port); } catch { return 0; } })();
+    const portFreeNow = port > 0 ? await portFree(port) : true;
+    if (!portFreeNow) return; // something else took the port; not our problem
+    clearInterval(externalWatchTimer);
+    externalWatchTimer = null;
+    log('external dsh at ' + dshUrl + ' died — offering takeover');
+    const choice = dialog.showMessageBoxSync({
+      type: 'warning',
+      title: APP_NAME,
+      message: '外部 DSH 服务已停止',
+      detail: '之前复用的外部 dsh（端口 ' + port + '）已停止响应。是否由 DSH DLE 接管启动？',
+      buttons: ['接管启动', '取消'],
+      defaultId: 0,
+    });
+    if (choice === 0) {
+      ownsDsh = false;
+      const portArg = await resolvePortArg();
+      startDsh(portArg);
+      waitForDsh(ok => {
+        if (ok) {
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
+          if (tray) tray.setToolTip(PRODUCT_NAME + ' — 本壳启动 dsh');
+        } else {
+          log('takeover start timed out');
+        }
+      });
+    }
+  }, 30 * 1000);
+}
+
     findExistingDsh(async foundUrl => {
       if (foundUrl) {
         // Reusing an already-running dsh (dev webui on 3080, a previous shell,
@@ -1064,6 +1146,7 @@ if (!gotLock) {
         log('reusing existing dsh at ' + dshUrl);
         if (tray) tray.setToolTip(PRODUCT_NAME + ' — 外部 dsh (端口 ' + new URL(dshUrl).port + ')');
         startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
+        watchExternalDsh();
       } else {
         const portArg = await resolvePortArg();
         if (!startDsh(portArg)) {
