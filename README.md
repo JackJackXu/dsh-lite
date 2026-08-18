@@ -52,9 +52,10 @@ DSH DLE/
 ├── main.js                  # 主进程（窗口 + 托盘 + 服务管理 + 单实例 + watcher 监督）
 ├── package.json             # 项目定义 + electron-builder 配置
 ├── LICENSE                  # MIT
-├── scripts/                 # 运行时 watcher（随安装包发布）
+├── scripts/                 # 运行时模块（随安装包发布）
 │   ├── session-watcher.js   # 任务完成通知（读会话日志，zstd 解码，30s 心跳）
 │   ├── mux-watcher.js       # 审批/选择题通知（连 mux WebSocket 流，30s 心跳）
+│   ├── port-utils.js        # 端口持久化 + 三态探测（main.js 共用）
 │   ├── icon-utils.js        # 开发用：图标脚本共享的 sharp 加载（不进安装包）
 │   ├── generate-whale-icon.js # 开发用：生成像素鲸鱼图标（不进安装包）
 │   ├── make-icon-from-png.js   # 开发用：从用户像素画生成图标（不进安装包）
