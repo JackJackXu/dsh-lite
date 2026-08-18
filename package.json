@@ -55,5 +55,8 @@
       "shortcutName": "DSH DLE",
       "deleteAppDataOnUninstall": false
     }
+  },
+  "allowScripts": {
+    "electron@41.10.5": true
   }
 }
