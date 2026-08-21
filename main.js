@@ -13,6 +13,14 @@
  *  - Logs to <dataDir>\logs\dsh-dle.log for plugin/service debugging.
  */
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor, globalShortcut } = require('electron');
+
+// EXPERIMENT (2026-08-21): the dsh web UI is much slower inside this Electron
+// window than in a plain browser tab. Prime suspect is the GPU path — on some
+// Windows setups Electron falls back to software rendering while Chrome/Edge
+// get hardware. Disabling hardware acceleration forces Chromium's (often
+// faster) software path; if the next build feels faster this stays, otherwise
+// delete this line and the boot GPU log tells us what the real state was.
+app.disableHardwareAcceleration();
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -1348,6 +1356,13 @@ if (!gotLock) {
     if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
     loadSettings();
     log('boot: ' + APP_NAME + ' v' + shellVersion());
+    // GPU diagnostic: compositing/webgl/rasterization tell us whether Chromium
+    // is on hardware or software rendering — the top suspect for "slower than
+    // a browser tab" (see the disableHardwareAcceleration experiment above).
+    try {
+      const gpu = app.getGPUFeatureStatus();
+      log('gpu: compositing=' + (gpu.compositing || '?') + ' webgl=' + (gpu.webgl || '?') + ' raster=' + (gpu.gpuRasterization || '?'));
+    } catch (e) { log('gpu diagnostic unavailable: ' + (e && e.message || e)); }
     log('data dir: ' + DATA_DIR);
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     installSecurityHooks();
