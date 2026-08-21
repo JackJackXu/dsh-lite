@@ -265,6 +265,9 @@ function probeUrl(url, cb) {
     res.on('data', c => {
       body += c;
       if (body.includes('id="root"') || body.includes('DeepSeek Harness')) once(true);
+      // Not a dsh page (or an unbounded stream): stop accumulating — the
+      // string scan below would otherwise grow O(n²) across chunks.
+      else if (body.length > 512 * 1024) { req.destroy(); once(false); }
     });
     res.on('end', () => once(res.statusCode === 200 && (body.includes('id="root"') || body.includes('DeepSeek Harness'))));
     res.on('error', () => once(false));
@@ -332,15 +335,39 @@ function truncateIfLarge(file) {
   bomVerified.add(file); // rewrite already stamped the BOM
 }
 
-function dshWebLog(data) {
+// dsh-web.log is written from dsh's stdout/stderr data events, which fire at
+// stream rate during agent output. A synchronous append per chunk would block
+// the main process (UI jank while streaming); buffer and flush on a short
+// timer or when the buffer reaches a chunk size instead. flushWebLog() is also
+// called on quit so the tail is never lost.
+const WEB_LOG_FILE = path.join(LOG_DIR, 'dsh-web.log');
+const WEB_LOG_FLUSH_MS = 300;
+const WEB_LOG_FLUSH_BYTES = 64 * 1024;
+let webLogBuffer = '';
+let webLogTimer = null;
+
+function flushWebLog() {
+  webLogTimer = null;
+  if (!webLogBuffer) return;
+  const chunk = webLogBuffer;
+  webLogBuffer = '';
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    const file = path.join(LOG_DIR, 'dsh-web.log');
-    truncateIfLarge(file);
-    ensureUtf8Bom(file);
-    fs.appendFileSync(file, data);
+    truncateIfLarge(WEB_LOG_FILE);
+    ensureUtf8Bom(WEB_LOG_FILE);
+    fs.appendFileSync(WEB_LOG_FILE, chunk);
   } catch {
-    bomVerified.delete(path.join(LOG_DIR, 'dsh-web.log'));
+    bomVerified.delete(WEB_LOG_FILE);
+  }
+}
+
+function dshWebLog(data) {
+  webLogBuffer += data;
+  if (webLogBuffer.length >= WEB_LOG_FLUSH_BYTES) {
+    if (webLogTimer) { clearTimeout(webLogTimer); webLogTimer = null; }
+    flushWebLog();
+  } else if (!webLogTimer) {
+    webLogTimer = setTimeout(flushWebLog, WEB_LOG_FLUSH_MS);
   }
 }
 
@@ -915,7 +942,7 @@ async function confirmAndUpdateDsh() {
       log('update restart spawn failed: ' + err.message);
       showSpawnError(err);
     });
-    waitForDsh((ok) => {
+    waitForDsh(() => {
       updateState.updating = false;
       setTrayTooltip(PRODUCT_NAME);
       if (tray) tray.displayBalloon({
@@ -956,7 +983,7 @@ function buildTrayMenu() {
       },
     },
     { label: 'Open Terminal (session dir)', click: openTerminal },
-    { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
+    { label: 'Reload UI', click: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload(); } },
     { label: 'Restart DSH Service', click: restartDsh },
     { label: updateState.candidate ? 'Update dsh to ' + updateState.candidate.version + '…' : 'Check for dsh updates', click: updateState.candidate ? confirmAndUpdateDsh : () => checkDshUpdate(false) },
     { label: 'dsh version: ' + (updateState.local || '?'), enabled: false },
@@ -977,15 +1004,19 @@ function createTray() {
   tray.on('click', () => showWindow());
 }
 
-function showAbout() {
-  let version = '?';
+// Shell's own package.json version, for the About dialog and the boot log
+// line. Read once per call — trivial cost, and keeps both call sites honest.
+function shellVersion() {
   try {
-    version = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '?';
-  } catch (e) { log('about: package.json unreadable: ' + (e && e.message || e)); }
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '?';
+  } catch { return '?'; }
+}
+
+function showAbout() {
   dialog.showMessageBox(mainWindow, {
     type: 'info',
     title: 'About ' + PRODUCT_NAME,
-    message: PRODUCT_NAME + '\nv' + version,
+    message: PRODUCT_NAME + '\nv' + shellVersion(),
     detail: 'DeepSeek Harness Desktop Lite Edition (thin Electron shell)\n\n' +
       'Shell data: ' + DATA_DIR + '\n' +
       'DSH home (shared with dev web profile): ' + DSH_HOME + '\n' +
@@ -1077,6 +1108,8 @@ function createWindow() {
       contextIsolation: true,
       sandbox: true,        // renderer process sandbox (like anywhere desktop)
       webSecurity: true,    // explicit same-origin policy (default, made visible)
+      spellcheck: false,    // default on: per-keystroke dictionary lookups make
+                            // textarea typing feel laggy vs a plain browser tab
     },
   });
 
@@ -1120,6 +1153,7 @@ function toggleWindow() {
 
 function quitApp() {
   isQuitting = true;
+  flushWebLog(); // never lose the buffered dsh-web.log tail on quit
   // Kill all children and wait for the tree kill to finish before quitting —
   // otherwise taskkill (async) races app.quit() and node.exe processes linger.
   const children = [dshProc, watcherProc, muxProc].filter(Boolean);
@@ -1195,80 +1229,6 @@ function installWakeRecovery() {
   });
 }
 
-/* ---------------- app lifecycle ---------------- */
-// Surface unexpected main-process errors instead of dying silently — the log
-// is where every other diagnostic lands. A single stray rejection is usually
-// recoverable; repeated crashes mean the shell is in a bad state, so surface
-// a dialog (without force-quitting: the crash-recovery already rebuilds the
-// window, and the user can restart from the tray).
-let uncaughtStreak = 0;
-// Shared accounting for uncaught exceptions AND unhandled rejections: log
-// always; after 3 in a row show a dialog (without force-quitting — the
-// crash-recovery already rebuilds the window, the user can restart from tray).
-function noteMainError(kind, detail) {
-  try { log(kind + ': ' + detail); } catch { /* ignore */ }
-  uncaughtStreak += 1;
-  if (uncaughtStreak < 3) return;
-  uncaughtStreak = 0;
-  try {
-    dialog.showMessageBox({
-      type: 'warning',
-      title: APP_NAME,
-      message: 'DSH DLE 主进程连续出错',
-      detail: '请从托盘菜单「重启服务」或退出后重新启动。详情见日志：' + LOG_DIR,
-      buttons: ['OK'],
-    });
-  } catch { /* dialog unavailable */ }
-}
-process.on('uncaughtException', (err) => noteMainError('uncaughtException', (err && err.stack || err)));
-process.on('unhandledRejection', (reason) => noteMainError('unhandledRejection', (reason instanceof Error ? reason.stack : String(reason))));
-
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => showWindow());
-
-  app.whenReady().then(async () => {
-    // Windows toast notifications require an AppUserModelID; without it they
-    // may not appear or may be attributed to "Electron".
-    if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
-    loadSettings();
-    let bootVersion = '?';
-    try {
-      bootVersion = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '?';
-    } catch (e) { log('boot: package.json unreadable: ' + (e && e.message || e)); }
-    log('boot: ' + APP_NAME + ' v' + bootVersion);
-    log('data dir: ' + DATA_DIR);
-    log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
-    installSecurityHooks();
-    installWakeRecovery();
-    // Global hotkey: Ctrl+Alt+D toggles the window from anywhere. A failed
-    // registration (another app owns the chord) is non-fatal — the tray
-    // click still shows the window. Unregistered on quit via will-quit.
-    try {
-      if (globalShortcut.register(TOGGLE_HOTKEY, toggleWindow)) {
-        log('global hotkey registered: ' + TOGGLE_HOTKEY);
-      } else {
-        log('global hotkey registration failed: ' + TOGGLE_HOTKEY + ' (already in use?)');
-      }
-    } catch (e) { log('global hotkey setup failed: ' + (e && e.message || e)); }
-    // Node feature gate: the watchers need zstd (node:zlib) + global
-    // WebSocket. Probe the features, not the version number; when missing,
-    // SKIP the watchers entirely (no point running them silently broken) and
-    // say so plainly.
-    const nodeExe = findNodeExe();
-    nodeOk = await checkNodeVersion(nodeExe);
-    if (nodeOk) {
-      startSessionWatcher();
-    } else {
-      log('WARNING: system Node lacks zstd/WebSocket support — notifications disabled (update Node to 22.15+)');
-    }
-    // dsh update check: at boot + every 24h. Boot is quiet (tooltip/menu only,
-    // no balloon while the user is just starting up); the 24h tick balloons
-    // only when a newer version actually appears.
-    checkDshUpdate(true);
-    setInterval(() => checkDshUpdate(false), UPDATE_INTERVAL_MS);
 // Reused-external-dsh health watch: the external service is not owned by us,
 // so its death would leave the window on a dead page with no signal. Probe it
 // every 30s; when it stops answering AND the port is free, tell the user and
@@ -1333,6 +1293,76 @@ function watchExternalDsh() {
   }, 30 * 1000);
 }
 
+/* ---------------- app lifecycle ---------------- */
+// Surface unexpected main-process errors instead of dying silently — the log
+// is where every other diagnostic lands. A single stray rejection is usually
+// recoverable; repeated crashes mean the shell is in a bad state, so surface
+// a dialog (without force-quitting: the crash-recovery already rebuilds the
+// window, and the user can restart from the tray).
+let uncaughtStreak = 0;
+// Shared accounting for uncaught exceptions AND unhandled rejections: log
+// always; after 3 in a row show a dialog (without force-quitting — the
+// crash-recovery already rebuilds the window, the user can restart from tray).
+function noteMainError(kind, detail) {
+  try { log(kind + ': ' + detail); } catch { /* ignore */ }
+  uncaughtStreak += 1;
+  if (uncaughtStreak < 3) return;
+  uncaughtStreak = 0;
+  try {
+    dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: 'DSH DLE 主进程连续出错',
+      detail: '请从托盘菜单「重启服务」或退出后重新启动。详情见日志：' + LOG_DIR,
+      buttons: ['OK'],
+    });
+  } catch { /* dialog unavailable */ }
+}
+process.on('uncaughtException', (err) => noteMainError('uncaughtException', (err && err.stack || err)));
+process.on('unhandledRejection', (reason) => noteMainError('unhandledRejection', (reason instanceof Error ? reason.stack : String(reason))));
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => showWindow());
+
+  app.whenReady().then(async () => {
+    // Windows toast notifications require an AppUserModelID; without it they
+    // may not appear or may be attributed to "Electron".
+    if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
+    loadSettings();
+    log('boot: ' + APP_NAME + ' v' + shellVersion());
+    log('data dir: ' + DATA_DIR);
+    log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
+    installSecurityHooks();
+    installWakeRecovery();
+    // Global hotkey: Ctrl+Alt+D toggles the window from anywhere. A failed
+    // registration (another app owns the chord) is non-fatal — the tray
+    // click still shows the window. Unregistered on quit via will-quit.
+    try {
+      if (globalShortcut.register(TOGGLE_HOTKEY, toggleWindow)) {
+        log('global hotkey registered: ' + TOGGLE_HOTKEY);
+      } else {
+        log('global hotkey registration failed: ' + TOGGLE_HOTKEY + ' (already in use?)');
+      }
+    } catch (e) { log('global hotkey setup failed: ' + (e && e.message || e)); }
+    // Node feature gate: the watchers need zstd (node:zlib) + global
+    // WebSocket. Probe the features, not the version number; when missing,
+    // SKIP the watchers entirely (no point running them silently broken) and
+    // say so plainly.
+    const nodeExe = findNodeExe();
+    nodeOk = await checkNodeVersion(nodeExe);
+    if (nodeOk) {
+      startSessionWatcher();
+    } else {
+      log('WARNING: system Node lacks zstd/WebSocket support — notifications disabled (update Node to 22.15+)');
+    }
+    // dsh update check: at boot + every 24h. Boot is quiet (tooltip/menu only,
+    // no balloon while the user is just starting up); the 24h tick balloons
+    // only when a newer version actually appears.
+    checkDshUpdate(true);
+    setInterval(() => checkDshUpdate(false), UPDATE_INTERVAL_MS);
     findExistingDsh(async foundUrl => {
       if (foundUrl) {
         // Reusing an already-running dsh (dev webui on 3080, a previous shell,
