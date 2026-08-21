@@ -955,6 +955,21 @@ async function confirmAndUpdateDsh() {
   }, 800);
 }
 
+// Reload UI with debounce + feedback: the dsh web app is a heavy SPA, so a
+// reload takes seconds and repeated tray clicks stack extra reloads (each one
+// cancels the previous load — the page thrashes and feels worse). One click,
+// the tooltip confirms the action, and further clicks within 5s are ignored.
+let reloadingAt = 0;
+function reloadUI() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const now = Date.now();
+  if (now - reloadingAt < 5000) return; // a reload is already in flight
+  reloadingAt = now;
+  setTrayTooltip(PRODUCT_NAME + ' — 刷新中…');
+  mainWindow.webContents.reload();
+  setTimeout(() => { if (!isQuitting) setTrayTooltip(PRODUCT_NAME); }, 5000);
+}
+
 /* ---------------- tray ---------------- */
 function loadTrayIcon() {
   const png = path.join(__dirname, 'assets', 'icon.png');
@@ -983,7 +998,7 @@ function buildTrayMenu() {
       },
     },
     { label: 'Open Terminal (session dir)', click: openTerminal },
-    { label: 'Reload UI', click: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload(); } },
+    { label: 'Reload UI', click: reloadUI },
     { label: 'Restart DSH Service', click: restartDsh },
     { label: updateState.candidate ? 'Update dsh to ' + updateState.candidate.version + '…' : 'Check for dsh updates', click: updateState.candidate ? confirmAndUpdateDsh : () => checkDshUpdate(false) },
     { label: 'dsh version: ' + (updateState.local || '?'), enabled: false },
