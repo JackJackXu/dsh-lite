@@ -419,7 +419,9 @@ function startDsh(portArg, onSpawnError) {
   env.DSH_HOME = DSH_HOME;
   fs.mkdirSync(DATA_DIR, { recursive: true });
   // Capture stdout to parse the announced port and to persist dsh-web.log.
-  const proc = spawn(nodeExe, [entry, 'web', '--port', portArg], {
+  // --no-open: dsh >= rc.8 opens the default browser by default (openBrowser
+  // defaults true); this shell IS the window, so a second browser tab is noise.
+  const proc = spawn(nodeExe, [entry, 'web', '--port', portArg, '--no-open'], {
     cwd: DATA_DIR,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
