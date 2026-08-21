@@ -14,13 +14,17 @@
  */
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor, globalShortcut } = require('electron');
 
-// EXPERIMENT (2026-08-21): the dsh web UI is much slower inside this Electron
-// window than in a plain browser tab. Prime suspect is the GPU path — on some
-// Windows setups Electron falls back to software rendering while Chrome/Edge
-// get hardware. Disabling hardware acceleration forces Chromium's (often
-// faster) software path; if the next build feels faster this stays, otherwise
-// delete this line and the boot GPU log tells us what the real state was.
+// KEEP (2026-08-21, verified): the dsh web UI was much slower inside this
+// Electron window than in a plain browser tab — including steering sends that
+// "stuck" in the composer. Disabling hardware acceleration forces Chromium's
+// software path, which fixed it (verified on the packaged build: sends and
+// steering behave like the browser now). Revisit if Electron/GPU drivers
+// improve; the boot GPU log line keeps the diagnostic data.
 app.disableHardwareAcceleration();
+// Bigger disk cache: the dsh web bundle is a few MB of JS; a small default
+// cache evicts it and reloads re-fetch/re-compile. 256MB keeps it resident,
+// so repeated Reload UI (with V8's own code cache) gets faster over time.
+app.commandLine.appendSwitch('disk-cache-size', '268435456');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
