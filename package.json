@@ -8,7 +8,7 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win",
-    "test": "node --check main.js && node --check scripts/session-watcher.js && node --check scripts/mux-watcher.js && node --check scripts/icon-utils.js && node --check scripts/generate-whale-icon.js && node --check scripts/make-icon-from-png.js && node --check scripts/sprite-to-png.js && node --check scripts/port-utils.js && node tests/port-utils.test.js && node tests/session-watcher.test.js"
+    "test": "node --check main.js && node --check scripts/session-watcher.js && node --check scripts/mux-watcher.js && node --check scripts/icon-utils.js && node --check scripts/generate-whale-icon.js && node --check scripts/make-icon-from-png.js && node --check scripts/sprite-to-png.js && node --check scripts/port-utils.js && node --check scripts/dsh-update.js && node tests/port-utils.test.js && node tests/session-watcher.test.js"
   },
   "devDependencies": {
     "electron": "^41.0.0",
@@ -28,6 +28,7 @@
     "files": [
       "main.js",
       "scripts/port-utils.js",
+      "scripts/dsh-update.js",
       "assets/**/*",
       "package.json"
     ],

@@ -19,7 +19,19 @@ DeepSeek Harness 的**轻薄桌面壳**：**Electron 窗口 + 托盘驻留 + 安
 - **唤醒恢复**：睡眠唤醒后自动检查服务存活并重连
 - **安全加固**：最小权限（仅剪贴板+全屏+通知）、外链走系统浏览器、禁止导航离开 dsh origin（含 iframe/重定向）、禁止 `<webview>`
 - **进程树回收**：退出时 `taskkill /T /F` 并等待完成，不留孤儿进程
+- **dsh 更新管理**：启动 + 每 24h 检查 npm 新版本，托盘 tooltip/菜单显示「当前 X · 最新 Y」；发现新版弹气球提示，托盘菜单一键更新（先停服务 → `npm i -g` 带完整 allow-scripts 防原生模块拦截 → 自动重启），失败保留旧版并提示回滚命令
+- **全局快捷键**：`Ctrl+Alt+D` 一键显示/隐藏窗口（即使最小化到托盘）
 - **日志落盘**：`%LOCALAPPDATA%\DSH DLE\logs\`（壳层 + dsh-web.log，均 5MB 轮转，UTF-8 BOM 防中文乱码）
+
+## Copilot 键改键（可选）
+
+新款键盘的 Copilot 键默认打开微软 Copilot。想让它改成「弹出 DSH DLE」：
+
+1. **Windows 11 组策略**（推荐，支持把 Copilot 键指向任意应用/快捷键）：`gpedit.msc` → 计算机配置 → 管理模板 → Windows 组件 → Copilot → 「配置 Copilot 硬件键行为」。家庭版没有 gpedit，可参考社区注册表教程
+2. **PowerToys 键盘管理器不支持**直接重映射 Copilot 键（微软 Issue [microsoft/PowerToys#35808](https://github.com/microsoft/PowerToys/issues/35808)），有变通但麻烦，不推荐
+3. 把 Copilot 键映射成 `Ctrl+Alt+D`（本壳默认全局快捷键），或改 `main.js` 的 `TOGGLE_HOTKEY` 常量后重新打包
+
+参考：组策略自定义教程（[cnblogs](https://www.cnblogs.com/AyeeMinerva/p/19530830)）、[TheWindowsClub 改键教程](https://www.thewindowsclub.com/how-to-change-copilot-key-action-in-windows)
 
 ## 环境要求
 

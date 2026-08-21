@@ -12,12 +12,13 @@
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
  *  - Logs to <dataDir>\logs\dsh-dle.log for plugin/service debugging.
  */
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor } = require('electron');
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor, globalShortcut } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const { readLastPort, savePort, portFree } = require('./scripts/port-utils.js');
+const { localDshVersion, fetchDshDistTags, updateCandidate, runGlobalUpdate } = require('./scripts/dsh-update.js');
 
 // Full product name (window title, tray tooltip, About). The short name is
 // used where space is tight (notifications, log lines).
@@ -821,6 +822,112 @@ function openPluginDir() {
   shell.openPath(DSH_HOME);
 }
 
+/* ---------------- dsh update manager ---------------- */
+// Check npmmirror for a newer @deepseek-ai/dsh (boot + every 24h); when one
+// exists, surface it in the tray tooltip/menu and balloon. The user confirms
+// from the tray, then the shell runs `npm i -g` (with the full allow-scripts
+// list — npm 11 blocks native-module install scripts otherwise, which broke
+// rc.8 upgrades on 2026-08-21), stopping the service first (npm cleanup hits
+// EPERM on in-use .node files) and restarting it afterwards.
+const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+let updateState = { local: null, candidate: null, checking: false, updating: false };
+
+async function checkDshUpdate(quiet) {
+  if (updateState.checking) return;
+  updateState.checking = true;
+  try {
+    const local = localDshVersion(findDshEntry());
+    const tags = await fetchDshDistTags();
+    const candidate = updateCandidate(local, tags);
+    updateState.local = local;
+    updateState.candidate = candidate;
+    if (candidate) {
+      log('dsh update available: ' + (local || '?') + ' -> ' + candidate.version + ' (' + candidate.tag + ')');
+      setTrayTooltip(PRODUCT_NAME + ' — dsh 可更新到 ' + candidate.version);
+      if (!quiet && tray) tray.displayBalloon({
+        title: APP_NAME,
+        content: '发现 dsh 新版本 ' + candidate.version + '（当前 ' + (local || '?') + '）。托盘菜单「Update dsh」可一键升级。',
+      });
+    } else {
+      log('dsh update check: current (' + (local || '?') + ')');
+      if (!quiet && tray) tray.displayBalloon({
+        title: APP_NAME,
+        content: 'dsh 已是最新版本（' + (local || '?') + '）。',
+      });
+    }
+    if (tray) tray.setContextMenu(buildTrayMenu());
+  } catch (e) {
+    log('dsh update check failed: ' + (e && e.message || e));
+  } finally {
+    updateState.checking = false;
+  }
+}
+
+async function confirmAndUpdateDsh() {
+  const cand = updateState.candidate;
+  if (!cand || updateState.updating) return;
+  const choice = dialog.showMessageBoxSync(mainWindow, {
+    type: 'question',
+    title: APP_NAME,
+    message: '更新 dsh 到 ' + cand.version + '？',
+    detail: '当前版本：' + (updateState.local || '?') + '\n\n将执行：\nnpm install -g @deepseek-ai/dsh@' + cand.version +
+      '\n\n更新会先停止 DSH 服务，完成后自动重启。失败时旧版本不受影响。',
+    buttons: ['更新', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (choice !== 0) return;
+  updateState.updating = true;
+  if (tray) tray.setContextMenu(buildTrayMenu());
+  await new Promise((resolve) => stopDsh(resolve));
+  const nodeExe = findNodeExe();
+  const npmPath = nodeExe ? path.join(path.dirname(nodeExe), 'npm.cmd') : 'npm';
+  const result = await runGlobalUpdate(cand.version, {
+    npmPath,
+    cwd: DATA_DIR,
+    onOutput: (s) => { const t = s.trim(); if (t) log('dsh update: ' + t); },
+  });
+  if (!result.ok) {
+    updateState.updating = false;
+    log('dsh update FAILED: ' + (result.error || ('exit ' + result.code)));
+    if (tray) tray.displayBalloon({ title: APP_NAME, content: 'dsh 更新失败。旧版本未受影响，详见日志。' });
+    dialog.showMessageBox(mainWindow, {
+      type: 'error',
+      title: APP_NAME,
+      message: 'dsh 更新失败',
+      detail: (result.error || ('npm exit code ' + result.code)) +
+        '\n\n旧版本未受影响。可手动执行：\nnpm install -g @deepseek-ai/dsh@' + (updateState.local || '?') + '\n\n日志：' + LOG_DIR,
+      buttons: ['OK'],
+    });
+    if (tray) tray.setContextMenu(buildTrayMenu());
+    return;
+  }
+  // Update succeeded: refresh the recorded version, restart the service
+  // (same pacing as restartDsh — stop happened above, spawn + wait below).
+  updateState.local = cand.version;
+  updateState.candidate = null;
+  log('dsh updated to ' + cand.version);
+  setTimeout(async () => {
+    const portArg = await resolvePortArg();
+    spawnFailed = false;
+    startDsh(portArg, (err) => {
+      spawnFailed = true;
+      log('update restart spawn failed: ' + err.message);
+      showSpawnError(err);
+    });
+    waitForDsh((ok) => {
+      updateState.updating = false;
+      setTrayTooltip(PRODUCT_NAME);
+      if (tray) tray.displayBalloon({
+        title: APP_NAME,
+        content: 'dsh 已更新到 ' + cand.version + '，服务已重启。',
+      });
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(dshUrl);
+      if (tray) tray.setContextMenu(buildTrayMenu());
+    });
+  }, 800);
+}
+
 /* ---------------- tray ---------------- */
 function loadTrayIcon() {
   const png = path.join(__dirname, 'assets', 'icon.png');
@@ -851,6 +958,8 @@ function buildTrayMenu() {
     { label: 'Open Terminal (session dir)', click: openTerminal },
     { label: 'Reload UI', click: () => { if (mainWindow) mainWindow.loadURL(dshUrl); } },
     { label: 'Restart DSH Service', click: restartDsh },
+    { label: updateState.candidate ? 'Update dsh to ' + updateState.candidate.version + '…' : 'Check for dsh updates', click: updateState.candidate ? confirmAndUpdateDsh : () => checkDshUpdate(false) },
+    { label: 'dsh version: ' + (updateState.local || '?'), enabled: false },
     { label: 'Open Plugin Directory', click: openPluginDir },
     { type: 'separator' },
     { label: 'About ' + APP_NAME, click: showAbout },
@@ -882,7 +991,8 @@ function showAbout() {
       'DSH home (shared with dev web profile): ' + DSH_HOME + '\n' +
       'URL: ' + dshUrl + '\n' +
       'Service: ' + (ownsDsh ? '由本壳启动' : '复用外部 dsh') + '\n' +
-      'Runtime: system node + dsh (no bundled runtime)\n\n' +
+      'Runtime: system node + dsh (no bundled runtime)\n' +
+      'dsh version: ' + (updateState.local || '?') + (updateState.candidate ? ' — 可更新到 ' + updateState.candidate.version + '（托盘菜单）' : '（最新）') + '\n\n' +
       'Notifications (task finished / approval / question) via built-in watchers.',
   });
 }
@@ -997,6 +1107,17 @@ function showWindow() {
   mainWindow.focus();
 }
 
+// Global hotkey: toggle the window (hide when visible, show otherwise). Works
+// even when the window is hidden in the tray, so the mouse never has to reach
+// the tray icon. The OS-level Copilot key can be remapped (Windows 11 group
+// policy / registry) to a shortcut that lands here — see README "Copilot key".
+const TOGGLE_HOTKEY = 'CommandOrControl+Alt+D';
+function toggleWindow() {
+  if (!mainWindow) { showWindow(); return; }
+  if (mainWindow.isVisible() && !mainWindow.isMinimized()) { mainWindow.hide(); return; }
+  showWindow();
+}
+
 function quitApp() {
   isQuitting = true;
   // Kill all children and wait for the tree kill to finish before quitting —
@@ -1010,6 +1131,10 @@ function quitApp() {
   };
   for (const p of children) killTree(p, done);
 }
+
+app.on('will-quit', () => {
+  try { globalShortcut.unregisterAll(); } catch { /* ignore */ }
+});
 
 /* ---------------- security hardening & window health ---------------- */
 // Least-privilege permissions (borrowed from bruc3van/dsh-desktop): the web UI
@@ -1118,6 +1243,16 @@ if (!gotLock) {
     log('fallback port: ' + FALLBACK_PORT + ' (OS-assigned real port parsed from stdout)');
     installSecurityHooks();
     installWakeRecovery();
+    // Global hotkey: Ctrl+Alt+D toggles the window from anywhere. A failed
+    // registration (another app owns the chord) is non-fatal — the tray
+    // click still shows the window. Unregistered on quit via will-quit.
+    try {
+      if (globalShortcut.register(TOGGLE_HOTKEY, toggleWindow)) {
+        log('global hotkey registered: ' + TOGGLE_HOTKEY);
+      } else {
+        log('global hotkey registration failed: ' + TOGGLE_HOTKEY + ' (already in use?)');
+      }
+    } catch (e) { log('global hotkey setup failed: ' + (e && e.message || e)); }
     // Node feature gate: the watchers need zstd (node:zlib) + global
     // WebSocket. Probe the features, not the version number; when missing,
     // SKIP the watchers entirely (no point running them silently broken) and
@@ -1129,6 +1264,11 @@ if (!gotLock) {
     } else {
       log('WARNING: system Node lacks zstd/WebSocket support — notifications disabled (update Node to 22.15+)');
     }
+    // dsh update check: at boot + every 24h. Boot is quiet (tooltip/menu only,
+    // no balloon while the user is just starting up); the 24h tick balloons
+    // only when a newer version actually appears.
+    checkDshUpdate(true);
+    setInterval(() => checkDshUpdate(false), UPDATE_INTERVAL_MS);
 // Reused-external-dsh health watch: the external service is not owned by us,
 // so its death would leave the window on a dead page with no signal. Probe it
 // every 30s; when it stops answering AND the port is free, tell the user and
