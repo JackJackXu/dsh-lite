@@ -132,12 +132,8 @@ function updateCandidate(local, tags) {
 function runGlobalUpdate(version, opts = {}) {
   const { npmPath = 'npm', cwd, onOutput } = opts
   return new Promise((resolve) => {
-    const args = [
-      'install',
-      '-g',
-      `@deepseek-ai/dsh@${version}`,
-      `--allow-scripts=${ALLOW_SCRIPTS}`,
-    ]
+    const spec = `@deepseek-ai/dsh@${version}`
+    const allow = `--allow-scripts=${ALLOW_SCRIPTS}`
     let output = ''
     let done = false
     const finish = (result) => {
@@ -147,16 +143,23 @@ function runGlobalUpdate(version, opts = {}) {
     }
     let proc
     try {
-      // Node cannot spawn .cmd/.bat files directly on Windows (spawn EINVAL);
-      // shell:true routes through cmd.exe, which handles the quoted path and
-      // forwards the args verbatim. args contain no shell metacharacters, so
-      // there is no injection surface here.
-      proc = spawn(npmPath, args, {
-        cwd,
-        windowsHide: true,
-        shell: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+      if (process.platform === 'win32') {
+        // cmd.exe /d /s /c with the WHOLE command line as one string: this
+        // sidesteps both Node's direct-.cmd spawn restriction (EINVAL) and
+        // shell:true's quoting quirks. The npm path is quoted; spec and allow
+        // contain no shell metacharacters, so there is no injection surface.
+        const cmdLine = `"${npmPath}" install -g ${spec} ${allow}`
+        proc = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], {
+          cwd,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+      } else {
+        proc = spawn(npmPath, ['install', '-g', spec, allow], {
+          cwd,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+      }
     } catch (err) {
       finish({ ok: false, code: null, error: String((err && err.message) || err), output })
       return
