@@ -147,7 +147,16 @@ function runGlobalUpdate(version, opts = {}) {
     }
     let proc
     try {
-      proc = spawn(npmPath, args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      // Node cannot spawn .cmd/.bat files directly on Windows (spawn EINVAL);
+      // shell:true routes through cmd.exe, which handles the quoted path and
+      // forwards the args verbatim. args contain no shell metacharacters, so
+      // there is no injection surface here.
+      proc = spawn(npmPath, args, {
+        cwd,
+        windowsHide: true,
+        shell: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
     } catch (err) {
       finish({ ok: false, code: null, error: String((err && err.message) || err), output })
       return
