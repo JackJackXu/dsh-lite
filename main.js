@@ -920,9 +920,8 @@ async function confirmAndUpdateDsh() {
   if (tray) tray.setContextMenu(buildTrayMenu());
   await new Promise((resolve) => stopDsh(resolve));
   const nodeExe = findNodeExe();
-  const npmPath = nodeExe ? path.join(path.dirname(nodeExe), 'npm.cmd') : 'npm';
   const result = await runGlobalUpdate(cand.version, {
-    npmPath,
+    nodeExe,
     cwd: DATA_DIR,
     onOutput: (s) => { const t = s.trim(); if (t) log('dsh update: ' + t); },
   });

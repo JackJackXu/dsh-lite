@@ -123,14 +123,15 @@ function updateCandidate(local, tags) {
 
 /**
  * 执行全局更新：`npm install -g @deepseek-ai/dsh@<version>`。
- * 显式 --allow-scripts（见文件头注释）。npm 在 Windows 上是 npm.cmd，
- * 由调用方传入（findNodeExe 同目录）。
+ * 显式 --allow-scripts（见文件头注释）。Windows 上用 node.exe 直接执行
+ * npm-cli.js（绕开 .cmd / cmd.exe / shell 的所有引号坑），nodeExe 由调用方
+ * 传入（findNodeExe()），npm-cli.js 在 node 安装目录的兄弟 node_modules 里。
  * @param {string} version 目标版本
- * @param {{npmPath?: string, cwd?: string, onOutput?: (s: string) => void}} [opts]
+ * @param {{nodeExe?: string, cwd?: string, onOutput?: (s: string) => void}} [opts]
  * @returns {Promise<{ok: boolean, code: number|null, error?: string, output: string}>}
  */
 function runGlobalUpdate(version, opts = {}) {
-  const { npmPath = 'npm', cwd, onOutput } = opts
+  const { nodeExe, cwd, onOutput } = opts
   return new Promise((resolve) => {
     const spec = `@deepseek-ai/dsh@${version}`
     const allow = `--allow-scripts=${ALLOW_SCRIPTS}`
@@ -143,20 +144,25 @@ function runGlobalUpdate(version, opts = {}) {
     }
     let proc
     try {
-      if (process.platform === 'win32') {
-        // cmd.exe /d /s /c with the WHOLE command line as one string: this
-        // sidesteps both Node's direct-.cmd spawn restriction (EINVAL) and
-        // shell:true's quoting quirks. The npm path is quoted; spec and allow
-        // contain no shell metacharacters, so there is no injection surface.
-        const cmdLine = `"${npmPath}" install -g ${spec} ${allow}`
-        proc = spawn('cmd.exe', ['/d', '/s', '/c', cmdLine], {
+      // npm's CLI is a plain JS file; run it with node.exe DIRECTLY. This
+      // sidesteps every Windows pitfall in one move: .cmd can't be spawned
+      // (EINVAL), cmd.exe /s strips the quoted path (exit 1 on Program
+      // Files), and shell:true has its own quoting quirks. A .exe plus an
+      // argument array has no shell parsing at all.
+      const npmCli = nodeExe
+        ? path.join(path.dirname(nodeExe), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+        : null
+      if (npmCli && fs.existsSync(npmCli)) {
+        proc = spawn(nodeExe, [npmCli, 'install', '-g', spec, allow], {
           cwd,
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'],
         })
       } else {
-        proc = spawn(npmPath, ['install', '-g', spec, allow], {
+        // Fallback: plain `npm` from PATH (non-Windows or unusual layout).
+        proc = spawn('npm', ['install', '-g', spec, allow], {
           cwd,
+          windowsHide: true,
           stdio: ['ignore', 'pipe', 'pipe'],
         })
       }
