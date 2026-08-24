@@ -83,10 +83,21 @@ function saveSettings() {
 // system node.exe can execute them as real files:
 //   dev:      <project>/scripts
 //   packaged: <installDir>/resources/scripts
-function scriptsDir() {
-  const inApp = path.join(__dirname, 'scripts');
-  if (fs.existsSync(inApp)) return inApp;
-  return path.join(path.dirname(__dirname), 'scripts');
+// Watcher scripts (session-watcher.js, mux-watcher.js) live OUTSIDE app.asar
+// in packaged builds (extraResources → <installDir>/resources/scripts) while
+// dev builds keep them at <project>/scripts. app.asar ALSO contains a scripts/
+// dir (port-utils.js, dsh-update.js are asar-internal modules), so testing
+// "does the dir exist" is wrong — it always matches in packaged builds and
+// the asar-external watcher would never be found (notifications silently
+// dead, which is exactly what the 2026-08-22..24 logs showed). Resolve by
+// FILE: dev path first, packaged path second.
+function watcherScript(name) {
+  const candidates = [
+    path.join(__dirname, 'scripts', name),
+    path.join(path.dirname(__dirname), 'scripts', name),
+  ];
+  for (const c of candidates) if (fs.existsSync(c)) return c;
+  return null;
 }
 
 let mainWindow = null;
@@ -666,7 +677,7 @@ function superviseWatcher(proc, label, restartFn) {
 //   {"event":"session",cwd}  -> remember the latest working directory
 function startSessionWatcher() {
   const nodeExe = findNodeExe();
-  const watcherJs = path.join(scriptsDir(), 'session-watcher.js');
+  const watcherJs = watcherScript('session-watcher.js');
   if (!nodeExe || !fs.existsSync(watcherJs)) { log('session watcher unavailable'); return; }
   // Sessions live in the shared DSH home (~/.dsh), same as the dev web profile.
   const sessionsDir = path.join(DSH_HOME, 'sessions');
@@ -785,7 +796,7 @@ function startMuxWatcher(wsUrl) {
   }
   muxUrl = wsUrl;
   const nodeExe = findNodeExe();
-  const muxJs = path.join(scriptsDir(), 'mux-watcher.js');
+  const muxJs = watcherScript('mux-watcher.js');
   if (!nodeExe || !fs.existsSync(muxJs)) { log('mux watcher unavailable'); return; }
   const proc = spawn(nodeExe, [muxJs, '--url', wsUrl], {
     cwd: DATA_DIR,
@@ -871,6 +882,28 @@ function openPluginDir() {
 const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let updateState = { local: null, candidate: null, checking: false, updating: false };
 
+// Update-check results must ALWAYS surface (the user clicked the menu item) —
+// unlike task notifications, which showNotification suppresses while the
+// window is focused. Tray balloons are unreliable on Windows 11, so use a
+// real toast (Electron Notification) with the same reference-keeping as
+// showNotification.
+function notifyCheckResult(body) {
+  if (!Notification.isSupported()) {
+    if (tray) tray.displayBalloon({ title: APP_NAME, content: body });
+    return;
+  }
+  try {
+    const n = new Notification({ title: APP_NAME, body });
+    n.on('click', () => showWindow());
+    n.on('close', () => {
+      const i = notifications.indexOf(n);
+      if (i >= 0) notifications.splice(i, 1);
+    });
+    notifications.push(n);
+    n.show();
+  } catch { /* notifications unavailable */ }
+}
+
 async function checkDshUpdate(quiet) {
   if (updateState.checking) return;
   updateState.checking = true;
@@ -883,20 +916,15 @@ async function checkDshUpdate(quiet) {
     if (candidate) {
       log('dsh update available: ' + (local || '?') + ' -> ' + candidate.version + ' (' + candidate.tag + ')');
       setTrayTooltip(PRODUCT_NAME + ' — dsh 可更新到 ' + candidate.version);
-      if (!quiet && tray) tray.displayBalloon({
-        title: APP_NAME,
-        content: '发现 dsh 新版本 ' + candidate.version + '（当前 ' + (local || '?') + '）。托盘菜单「Update dsh」可一键升级。',
-      });
+      if (!quiet) notifyCheckResult('发现 dsh 新版本 ' + candidate.version + '（当前 ' + (local || '?') + '）。托盘菜单「Update dsh」可一键升级。');
     } else {
       log('dsh update check: current (' + (local || '?') + ')');
-      if (!quiet && tray) tray.displayBalloon({
-        title: APP_NAME,
-        content: 'dsh 已是最新版本（' + (local || '?') + '）。',
-      });
+      if (!quiet) notifyCheckResult('dsh 已是最新版本（' + (local || '?') + '）。');
     }
     if (tray) tray.setContextMenu(buildTrayMenu());
   } catch (e) {
     log('dsh update check failed: ' + (e && e.message || e));
+    if (!quiet) notifyCheckResult('检查 dsh 更新失败：' + (e && e.message || e));
   } finally {
     updateState.checking = false;
   }
