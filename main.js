@@ -14,13 +14,14 @@
  */
 const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor, globalShortcut } = require('electron');
 
-// KEEP (2026-08-21, verified): the dsh web UI was much slower inside this
-// Electron window than in a plain browser tab — including steering sends that
-// "stuck" in the composer. Disabling hardware acceleration forces Chromium's
-// software path, which fixed it (verified on the packaged build: sends and
-// steering behave like the browser now). Revisit if Electron/GPU drivers
-// improve; the boot GPU log line keeps the diagnostic data.
-app.disableHardwareAcceleration();
+// GPU: the dsh web UI felt slower inside Electron than in a plain browser
+// tab. Electron's Chromium applies a STRICTER GPU blocklist than Chrome/Edge,
+// so a healthy GPU can be blacklisted and fall back to slow software
+// rendering — the browser then beats us for no reason. Force the GPU on
+// (ignore-gpu-blocklist + GPU rasterization); if the boot log ever shows a
+// GPU process crash, the driver really is broken and we would re-disable.
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
 // Bigger disk cache: the dsh web bundle is a few MB of JS; a small default
 // cache evicts it and reloads re-fetch/re-compile. 256MB keeps it resident,
 // so repeated Reload UI (with V8's own code cache) gets faster over time.
@@ -1222,6 +1223,13 @@ function quitApp() {
 
 app.on('will-quit', () => {
   try { globalShortcut.unregisterAll(); } catch { /* ignore */ }
+});
+
+// If the GPU process dies mid-session the renderer falls back silently and
+// the UI slows down; log it so a bad driver is diagnosable from the shell log
+// (the boot GPU diagnostic line shows the hardware/software state).
+app.on('gpu-process-crashed', (_e, killed) => {
+  log('GPU process ' + (killed ? 'killed' : 'crashed') + ' — hardware acceleration may be unstable');
 });
 
 /* ---------------- security hardening & window health ---------------- */
