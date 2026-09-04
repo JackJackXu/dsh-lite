@@ -22,3 +22,20 @@ jobs:
       # Static analysis: `no-undef` catches exactly the class of bug that the
       # createWindow `win` regression was (reference to an undeclared name).
       - run: npx eslint main.js scripts/*.js
+
+  # Build a Windows NSIS installer so every push yields a downloadable artifact
+  # (previously installers were only produced manually on the dev machine).
+  package-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - run: npm install
+      - run: npm run dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-dle-windows
+          path: release/*.exe
+          if-no-files-found: error
