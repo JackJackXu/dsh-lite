@@ -12,7 +12,7 @@
  *  - QQ-style tray: close hides to tray; tray menu drives everything.
  *  - Logs to <dataDir>\logs\dsh-dle.log for plugin/service debugging.
  */
-const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor, globalShortcut } = require('electron');
+const { app, BrowserWindow, Tray, Menu, shell, nativeImage, dialog, Notification, session, powerMonitor, globalShortcut, screen } = require('electron');
 
 // GPU: the dsh web UI felt slower inside Electron than in a plain browser
 // tab. Electron's Chromium applies a STRICTER GPU blocklist than Chrome/Edge,
@@ -58,13 +58,17 @@ const LOG_DIR = path.join(DATA_DIR, 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'dsh-dle.log');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
-// User settings (persisted). Only notifications toggle for now.
+// User settings (persisted): notifications toggle + last window bounds.
 let notificationsEnabled = true;
+// Last window bounds {x,y,width,height,maximized}, restored on next launch.
+let winBounds = null;
+let boundsSaveTimer = null;
 
 function loadSettings() {
   try {
     const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
     if (typeof s.notifications === 'boolean') notificationsEnabled = s.notifications;
+    if (s.winBounds && typeof s.winBounds === 'object') winBounds = s.winBounds;
   } catch (e) {
     // First run (no file) is normal; a corrupt file should not silently reset
     // the user's choices, so note it instead of swallowing it.
@@ -75,8 +79,28 @@ function loadSettings() {
 function saveSettings() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ notifications: notificationsEnabled }, null, 2));
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ notifications: notificationsEnabled, winBounds }, null, 2));
   } catch (e) { log('settings save failed: ' + (e && e.message || e)); }
+}
+
+// Remember the window's current geometry so a relaunch feels continuous.
+function captureWinBounds() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const maximized = mainWindow.isMaximized();
+  // getNormalBounds() returns the restored geometry even while maximized.
+  const b = mainWindow.getNormalBounds();
+  winBounds = { x: b.x, y: b.y, width: b.width, height: b.height, maximized };
+}
+
+// Debounced save on move/resize — firehose of events must not sync-write every
+// frame; the geometry only matters when we're about to leave.
+function scheduleBoundsSave() {
+  if (boundsSaveTimer) clearTimeout(boundsSaveTimer);
+  boundsSaveTimer = setTimeout(() => {
+    boundsSaveTimer = null;
+    captureWinBounds();
+    saveSettings();
+  }, 500);
 }
 
 // Bundled scripts dir (session-watcher.js, mux-watcher.js).
@@ -1145,8 +1169,8 @@ function shellVersion() {
   } catch { return '?'; }
 }
 
-function showAbout() {
-  dialog.showMessageBox(mainWindow, {
+async function showAbout() {
+  const { response } = await dialog.showMessageBox(mainWindow, {
     type: 'info',
     title: 'About ' + PRODUCT_NAME,
     message: PRODUCT_NAME + '\nv' + shellVersion(),
@@ -1158,7 +1182,16 @@ function showAbout() {
       'Runtime: system node + dsh (no bundled runtime)\n' +
       'dsh version: ' + (updateState.local || '?') + (updateState.candidate ? ' — 可更新到 ' + updateState.candidate.version + '（托盘菜单）' : '（最新）') + '\n\n' +
       'Notifications (task finished / approval / question) via built-in watchers.',
+    buttons: ['检查更新', 'OK'],
+    defaultId: 1,
+    cancelId: 1,
   });
+  // "检查更新": run a fresh check and report via a toast, then re-open About
+  // so the user sees the refreshed version line.
+  if (response === 0) {
+    await checkDshUpdate(false);
+    showAbout();
+  }
 }
 
 /* ---------------- window ---------------- */
@@ -1227,9 +1260,22 @@ function setupCrashRecovery(win) {
 
 function createWindow() {
   const iconPath = path.join(__dirname, 'assets', 'icon.png');
+  // Restore the last geometry only if it still lands on a connected display
+  // (a monitor can be unplugged between runs; a bogus position would otherwise
+  // drop the window off-screen). Falls back to the defaults otherwise.
+  let restored = null;
+  if (winBounds && winBounds.width && winBounds.height) {
+    const onScreen = screen.getAllDisplays().some(d => {
+      const a = d.workArea;
+      return winBounds.x < a.x + a.width && winBounds.x + winBounds.width > a.x &&
+             winBounds.y < a.y + a.height && winBounds.y + winBounds.height > a.y;
+    });
+    if (onScreen) restored = {
+      x: winBounds.x, y: winBounds.y, width: winBounds.width, height: winBounds.height,
+    };
+  }
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 840,
+    ...(restored || { width: 1280, height: 840 }),
     minWidth: 900,
     minHeight: 600,
     title: PRODUCT_NAME,
@@ -1245,6 +1291,8 @@ function createWindow() {
                             // textarea typing feel laggy vs a plain browser tab
     },
   });
+  // A maximized window should come back maximized, not at its restored size.
+  if (restored && winBounds && winBounds.maximized) mainWindow.maximize();
 
   const win = mainWindow;
 
@@ -1252,11 +1300,19 @@ function createWindow() {
   setupCrashRecovery(win);
 
   win.on('close', e => {
+    // Remember where the user left the window (fires on hide AND on quit).
+    if (mainWindow === win) { captureWinBounds(); saveSettings(); }
     // Tray app: closing hides instead of quitting (unless actually quitting).
     // Hide the closing window itself, not the module-level mainWindow — a
     // crash rebuild may have replaced it by the time a stale close fires.
     if (!isQuitting) { e.preventDefault(); win.hide(); }
   });
+  // Live geometry changes (drag/resize/maximize) persist debounced so a crash
+  // or force-quit still keeps the last-known bounds.
+  win.on('resize', scheduleBoundsSave);
+  win.on('move', scheduleBoundsSave);
+  win.on('maximize', scheduleBoundsSave);
+  win.on('unmaximize', scheduleBoundsSave);
   // Stale-close guard (same pattern as the subprocess exit handlers): a crash
   // rebuild destroys the old window and creates a new one; the old window's
   // async 'closed' event must not null out the NEW mainWindow reference.
@@ -1264,6 +1320,17 @@ function createWindow() {
   // Keep the window title stable: dsh pages rewrite document.title on load,
   // which would overwrite the product name in the title bar.
   win.on('page-title-updated', e => e.preventDefault());
+
+  // The boot-time getGPUFeatureStatus() (right after app ready) returns
+  // compositing=? / webgl=disabled_off / raster=? because the GPU process is
+  // still starting. Re-read once a real renderer exists so the log shows the
+  // actual HW/SW state instead of a misleading early read.
+  setTimeout(() => {
+    try {
+      const gpu = app.getGPUFeatureStatus();
+      log('gpu (post-window): compositing=' + (gpu.compositing || '?') + ' webgl=' + (gpu.webgl || '?') + ' raster=' + (gpu.gpuRasterization || '?'));
+    } catch { /* ignore */ }
+  }, 5000);
 }
 
 function showWindow() {
