@@ -63,12 +63,19 @@ let notificationsEnabled = true;
 // Last window bounds {x,y,width,height,maximized}, restored on next launch.
 let winBounds = null;
 let boundsSaveTimer = null;
+// Start DSH DLE automatically when the user logs into Windows (tray toggle).
+let launchAtLogin = false;
+// Schema of the persisted settings file. Bump when adding a breaking field so
+// loadSettings() can migrate old files instead of guessing.
+const SETTINGS_SCHEMA_VERSION = 1;
 
 function loadSettings() {
   try {
     const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    migrateSettings(s); // future-proof: transform older shapes before reading
     if (typeof s.notifications === 'boolean') notificationsEnabled = s.notifications;
     if (s.winBounds && typeof s.winBounds === 'object') winBounds = s.winBounds;
+    if (typeof s.launchAtLogin === 'boolean') launchAtLogin = s.launchAtLogin;
   } catch (e) {
     // First run (no file) is normal; a corrupt file should not silently reset
     // the user's choices, so note it instead of swallowing it.
@@ -76,11 +83,40 @@ function loadSettings() {
   }
 }
 
+// Migrate an older settings file to the current schema before the fields are
+// read. v1 fields (notifications/winBounds/launchAtLogin) have been stable, so
+// there is nothing to rewrite yet — this hook exists so a future schema bump
+// has a single, obvious place to run its migrations.
+function migrateSettings(s) {
+  if (typeof s.schemaVersion === 'number' && s.schemaVersion >= SETTINGS_SCHEMA_VERSION) return;
+  // v0 (no schemaVersion) -> v1: no field rename needed; nothing to do.
+}
+
 function saveSettings() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ notifications: notificationsEnabled, winBounds }, null, 2));
+    const data = {
+      schemaVersion: SETTINGS_SCHEMA_VERSION,
+      notifications: notificationsEnabled,
+      launchAtLogin,
+      winBounds,
+    };
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(data, null, 2));
   } catch (e) { log('settings save failed: ' + (e && e.message || e)); }
+}
+
+// Toggle "start with Windows". On Windows app.setLoginItemSettings registers an
+// entry in the user's startup (a .lnk in the shell:startup folder for packaged
+// apps). Persisted so the choice survives restarts.
+function setLaunchAtLogin(enabled) {
+  try {
+    app.setLoginItemSettings({ openAtLogin: enabled });
+    launchAtLogin = enabled;
+    saveSettings();
+    log('launch at login ' + (enabled ? 'on' : 'off'));
+  } catch (e) {
+    log('setLoginItemSettings failed: ' + (e && e.message || e));
+  }
 }
 
 // Remember the window's current geometry so a relaunch feels continuous.
@@ -1139,6 +1175,15 @@ function buildTrayMenu() {
         log('notifications ' + (notificationsEnabled ? 'enabled' : 'disabled'));
       },
     },
+    {
+      label: launchAtLogin ? 'Launch at Login: On' : 'Launch at Login: Off',
+      type: 'checkbox',
+      checked: launchAtLogin,
+      click: (item) => {
+        setLaunchAtLogin(item.checked);
+        if (tray) tray.setContextMenu(buildTrayMenu());
+      },
+    },
     { label: 'Open Terminal (session dir)', click: openTerminal },
     { label: 'Reload UI', click: reloadUI },
     { label: 'Restart DSH Service', click: restartDsh },
@@ -1258,7 +1303,7 @@ function setupCrashRecovery(win) {
   });
 }
 
-function createWindow() {
+function createWindow(showLoading = false) {
   const iconPath = path.join(__dirname, 'assets', 'icon.png');
   // Restore the last geometry only if it still lands on a connected display
   // (a monitor can be unplugged between runs; a bogus position would otherwise
@@ -1296,7 +1341,13 @@ function createWindow() {
 
   const win = mainWindow;
 
-  win.loadURL(dshUrl);
+  if (showLoading) {
+    // Show a local "starting" page immediately; the real dsh UI is swapped in
+    // by the boot flow once the service is ready — no blank/black wait.
+    win.loadFile(path.join(__dirname, 'assets', 'loading.html'));
+  } else {
+    win.loadURL(dshUrl);
+  }
   setupCrashRecovery(win);
 
   win.on('close', e => {
@@ -1539,6 +1590,9 @@ if (!gotLock) {
     // may not appear or may be attributed to "Electron".
     if (process.platform === 'win32') app.setAppUserModelId('com.deepseek.dshdle');
     loadSettings();
+    // Re-apply the persisted "start with Windows" choice (Windows may not keep
+    // it if the user only set it via another launch). No save: nothing changed.
+    try { app.setLoginItemSettings({ openAtLogin: launchAtLogin }); } catch (e) { log('login item apply failed: ' + (e && e.message || e)); }
     log('boot: ' + APP_NAME + ' v' + shellVersion());
     // GPU diagnostic: compositing/webgl/rasterization tell us whether Chromium
     // is on hardware or software rendering — the top suspect for "slower than
@@ -1577,6 +1631,11 @@ if (!gotLock) {
     // only when a newer version actually appears.
     checkDshUpdate(true);
     setInterval(() => checkDshUpdate(false), UPDATE_INTERVAL_MS);
+    // Show the shell window (local loading page) and tray immediately, so the
+    // user gets instant feedback while dsh starts; the ready path below swaps
+    // the loading page for the real WebUI.
+    createWindow(true);
+    createTray();
     findExistingDsh(async (foundUrl, authGated) => {
       if (foundUrl) {
         // Reusing an already-running dsh (dev webui on 3080, a previous shell,
@@ -1654,8 +1713,14 @@ if (!gotLock) {
           setTimeout(() => quitApp(), 4000);
           return; // no blank window pointing at a dead URL
         }
-        createWindow();
-        createTray();
+        // dsh is ready: swap the loading page for the real WebUI in the window
+        // we already showed at boot (fall back to building one if it's gone).
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL(dshUrl);
+        } else {
+          createWindow();
+          createTray();
+        }
       });
     });
   });
