@@ -1,6 +1,6 @@
 {
   "name": "dsh-dle",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "DSH DLE — DeepSeek Harness Desktop Lite Edition: thin Electron shell (tray + notifications + security) sharing the dev ~/.dsh profile",
   "main": "main.js",
   "author": "DSH DLE",
