@@ -16,6 +16,9 @@
     "eslint": "^9.0.0",
     "globals": "^14.0.0"
   },
+  "overrides": {
+    "clone-response": "1.0.3"
+  },
   "build": {
     "appId": "com.deepseek.dshdle",
     "productName": "DSH DLE",
