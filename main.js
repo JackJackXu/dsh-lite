@@ -138,6 +138,23 @@ function setTrayTooltip(text) {
   pendingTooltip = text;
 }
 
+// dsh >= 0.1.2-rc.1 prints the web URL WITH a per-process auth token
+// ("dsh web: http://127.0.0.1:<port>/?token=…"); the root page 401s without
+// it. The mux events WebSocket lives at /api/events.mux and is gated by the
+// SAME token, so build it from the full URL (keep the ?token= query) instead
+// of naive string concatenation, which would append the path AFTER the query
+// string (a malformed ws URL — the recurring code 1006 reconnect spam).
+function eventsMuxUrl(base) {
+  try {
+    const u = new URL(base);
+    u.protocol = u.protocol.startsWith('https') ? 'wss:' : 'ws:';
+    u.pathname = '/api/events.mux';
+    return u.toString();
+  } catch {
+    return base.replace(/^http/, 'ws') + '/api/events.mux';
+  }
+}
+
 /* ---------------- logging ---------------- */
 // UTF-8 BOM (0xEF 0xBB 0xBF): Windows PowerShell and Notepad decode files
 // without a BOM using the legacy ANSI codepage (GBK on zh-CN systems), which
@@ -276,28 +293,60 @@ function findDshEntry() {
 // No byte cap: the "id="root"" marker can legally sit past 2KB in a large
 // initial HTML, and truncating would mis-detect a LIVE dsh as absent (then
 // spawn a duplicate). Match incrementally and finish on the first hit.
+// Probe whether a dsh web UI answers at this URL. dsh >= 0.1.2-rc.1 gates the
+// app behind a per-process token that is EXCHANGED for an HttpOnly auth cookie:
+//   GET <url>/?token=…          -> 303 See Other + Set-Cookie: dsh-auth-…=JWT
+//   GET /  (carrying that cookie) -> 200 app HTML (id="root" / "DeepSeek Harness")
+// A bare GET (no redirect, no cookie) always lands on a 401/303, so the old
+// probe could never see a healthy 0.1.2+ service — the "endless startup
+// timeout, black shell" upgrade trap. Walk the handshake like a browser,
+// carrying the cookie across hops, and only call back true on a 200 body that
+// carries the app markers.
+const REDIRECT_MAX = 5;
+const PROBE_DEADLINE_MS = 3000;
+
 function probeUrl(url, cb) {
   let done = false;
-  const once = result => {
-    if (done) return;
-    done = true;
-    req.destroy();
-    cb(result);
-  };
-  let body = '';
-  const req = http.get(url, res => {
-    res.on('data', c => {
-      body += c;
-      if (body.includes('id="root"') || body.includes('DeepSeek Harness')) once(true);
-      // Not a dsh page (or an unbounded stream): stop accumulating — the
-      // string scan below would otherwise grow O(n²) across chunks.
-      else if (body.length > 512 * 1024) { req.destroy(); once(false); }
+  const once = result => { if (done) return; done = true; cb(result); };
+  const deadline = Date.now() + PROBE_DEADLINE_MS;
+  const hasMarker = body => body.includes('id="root"') || body.includes('DeepSeek Harness');
+
+  const attempt = (target, cookie, hops) => {
+    let body = '';
+    let req;
+    const finish = ok => once(ok);
+    const headers = cookie ? { Cookie: cookie } : {};
+    req = http.get(target, { headers }, res => {
+      const setCookies = res.headers['set-cookie'];
+      const newCookie = setCookies
+        ? (cookie ? cookie + '; ' : '') + (Array.isArray(setCookies) ? setCookies : [setCookies]).map(c => c.split(';')[0]).join('; ')
+        : cookie;
+      const loc = res.headers.location;
+      if (loc && (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 303 || res.statusCode === 307 || res.statusCode === 308)) {
+        // Drain the redirect body, then follow with the freshly-set cookie.
+        res.resume();
+        if (hops >= REDIRECT_MAX || Date.now() >= deadline) return finish(false);
+        try {
+          attempt(new URL(loc, target).toString(), newCookie, hops + 1);
+        } catch { finish(false); }
+        return;
+      }
+      res.on('data', c => {
+        body += c;
+        if (hasMarker(body)) { res.destroy(); finish(true); }
+        // Not a dsh page (or an unbounded stream): stop accumulating — the
+        // string scan below would otherwise grow O(n²) across chunks.
+        else if (body.length > 512 * 1024) { res.destroy(); finish(false); }
+      });
+      res.on('end', () => finish(res.statusCode === 200 && hasMarker(body)));
+      res.on('error', () => finish(false));
     });
-    res.on('end', () => once(res.statusCode === 200 && (body.includes('id="root"') || body.includes('DeepSeek Harness'))));
-    res.on('error', () => once(false));
-  });
-  req.on('error', () => once(false));
-  req.setTimeout(1500, () => { req.destroy(); once(false); });
+    req.on('error', () => finish(false));
+    const remain = Math.max(0, deadline - Date.now());
+    req.setTimeout(remain, () => { try { req.destroy(); } catch { /* ignore */ } finish(false); });
+  };
+
+  attempt(url, null, 0);
 }
 
 function probeDsh(cb) { probeUrl(dshUrl, cb); }
@@ -501,7 +550,10 @@ function startDsh(portArg, onSpawnError) {
     while ((nl = outBuf.indexOf('\n')) >= 0) {
       const line = outBuf.slice(0, nl);
       outBuf = outBuf.slice(nl + 1);
-      const m = /dsh web: (https?:\/\/127\.0\.0\.1:\d+)/.exec(line);
+      // Capture the WHOLE printed URL. dsh >= 0.1.2-rc.1 appends a per-process
+      // auth token ("…?token=…"); truncating at the port (the old regex) drops
+      // it, and the root page then 401s forever (startup timeout, black shell).
+      const m = /dsh web: (https?:\/\/[^\s\r]+)/.exec(line);
       if (m) {
         dshUrl = m[1];
         try {
@@ -510,7 +562,7 @@ function startDsh(portArg, onSpawnError) {
         } catch { /* ignore */ }
         log('resolved dsh url: ' + dshUrl);
         setTrayTooltip(PRODUCT_NAME + ' — 本壳启动 dsh');
-        startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux'); // approval/question notifications
+        startMuxWatcher(eventsMuxUrl(dshUrl)); // approval/question notifications
       }
     }
   });
@@ -1442,7 +1494,7 @@ if (!gotLock) {
         ownsDsh = false; // external service: Restart must not spawn a second dsh
         log('reusing existing dsh at ' + dshUrl);
         setTrayTooltip(PRODUCT_NAME + ' — 外部 dsh (端口 ' + new URL(dshUrl).port + ')');
-        startMuxWatcher(dshUrl.replace(/^http/, 'ws') + '/api/events.mux');
+        startMuxWatcher(eventsMuxUrl(dshUrl));
         watchExternalDsh();
       } else {
         const portArg = await resolvePortArg();
@@ -1468,10 +1520,17 @@ if (!gotLock) {
             // The failure dialog already told the user; never stack the 40s
             // timeout dialog on top, and never open a window at a dead URL.
             log('start already failed — skipping timeout dialog and window');
-            return;
+          } else {
+            log('DSH service start timeout');
+            showStartupTimeout();
           }
-          log('DSH service start timeout');
-          showStartupTimeout();
+          // A failed boot must NOT linger as a headless resident holding the
+          // single-instance lock — that is exactly how a broken start becomes
+          // an invisible "black window, no tray" app that blocks every later
+          // relaunch (the recurring post-upgrade trap). Quit so the next
+          // launch starts from a clean slate. Delay a little so the user sees
+          // the dialog before the app disappears.
+          setTimeout(() => quitApp(), 4000);
           return; // no blank window pointing at a dead URL
         }
         createWindow();
