@@ -355,6 +355,27 @@ function probeDsh(cb) { probeUrl(dshUrl, cb); }
 // (3080), this shell's fallback (3081), and the port we last used — so an
 // already-running dsh is REUSED instead of starting a second instance that
 // writes the same ~/.dsh concurrently (corruption risk).
+// dsh >= 0.1.2 gates the UI behind a token we don't hold for external dsh, so
+// probeUrl can't "see" it as reusable — but it still answers with a 401 auth
+// marker. Report that as authGated so the caller can warn instead of silently
+// double-opening the shared data dir.
+function detectAuthGated(url, cb) {
+  let done = false;
+  const once = r => { if (done) return; done = true; cb(r); };
+  const req = http.get(url, res => {
+    let body = '';
+    res.on('data', c => {
+      body += c;
+      if (body.includes('dsh web authentication required')) { req.destroy(); once(true); }
+      else if (body.length > 8192) { req.destroy(); once(false); }
+    });
+    res.on('end', () => once(false));
+    res.on('error', () => once(false));
+  });
+  req.on('error', () => once(false));
+  req.setTimeout(2000, () => { try { req.destroy(); } catch { /* ignore */ } once(false); });
+}
+
 function findExistingDsh(cb) {
   const ports = [...new Set([
     Number(process.env.DSH_DLE_PORT) || 0,
@@ -362,17 +383,22 @@ function findExistingDsh(cb) {
     readLastPort(PORT_FILE),
     3080, // dev webui default
   ].filter(p => p > 0))];
-  let i = 0;
-  const tryNext = () => {
-    if (i >= ports.length) { cb(null); return; }
-    const url = 'http://127.0.0.1:' + ports[i];
+  let idx = 0;
+  let authGated = false;
+  const step = () => {
+    if (idx >= ports.length) { cb(null, authGated); return; }
+    const url = 'http://127.0.0.1:' + ports[idx];
+    idx += 1;
     probeUrl(url, ok => {
-      if (ok) { cb(url); return; }
-      i += 1;
-      tryNext();
+      if (ok) { cb(url, false); return; }
+      // Not reusable — but is a (token-gated) dsh actually there?
+      detectAuthGated(url, gated => {
+        if (gated) authGated = true;
+        step();
+      });
     });
   };
-  tryNext();
+  step();
 }
 
 function waitForDsh(cb) {
@@ -1484,7 +1510,7 @@ if (!gotLock) {
     // only when a newer version actually appears.
     checkDshUpdate(true);
     setInterval(() => checkDshUpdate(false), UPDATE_INTERVAL_MS);
-    findExistingDsh(async foundUrl => {
+    findExistingDsh(async (foundUrl, authGated) => {
       if (foundUrl) {
         // Reusing an already-running dsh (dev webui on 3080, a previous shell,
         // or our last port): the stdout URL-parser never ran, so update the
@@ -1497,21 +1523,49 @@ if (!gotLock) {
         startMuxWatcher(eventsMuxUrl(dshUrl));
         watchExternalDsh();
       } else {
+        if (authGated) {
+          // A dsh (>=0.1.2, token-gated) is already running on the shared
+          // ~/.dsh but we don't hold its token, so we can't reuse it. Warn the
+          // user instead of silently starting a SECOND dsh that writes the same
+          // data concurrently (the instability/corruption the docs warn about).
+          log('another auth-gated dsh detected — asking before spawning a second');
+          const { response } = await dialog.showMessageBox({
+            type: 'warning',
+            title: APP_NAME,
+            message: '检测到另一个 dsh 正在运行',
+            detail: '在共享数据目录 ~/.dsh 上已有另一个 dsh 在运行（可能是开发版 web 或另一个 DSH DLE）。' +
+              '两个 dsh 并发写同一份数据会导致不稳定甚至损坏，建议先关闭它。\n\n' +
+              '仍要让 DSH DLE 再启动一个 dsh 吗？',
+            buttons: ['退出（推荐）', '仍然启动'],
+            defaultId: 0,
+            cancelId: 0,
+          });
+          if (response !== 1) {
+            log('user chose to quit after double-open was detected');
+            quitApp();
+            return;
+          }
+        }
         const portArg = await resolvePortArg();
         spawnFailed = false;
-        if (!startDsh(portArg, (err) => {
+        const spawned = startDsh(portArg, (err) => {
           // Spawn succeeded at call time but the process errored right after
           // (e.g. node.exe exists but fails to launch): fail fast instead of
           // waiting out the 40s generic timeout.
           spawnFailed = true;
           log('dsh spawn failed asynchronously: ' + err.message);
           showSpawnError(err);
-        })) {
+        });
+        if (!spawned) {
           // Nothing was spawned (missing node/dsh): fail fast with an
           // actionable message instead of a 40s generic timeout.
           spawnFailed = true;
           log('startDsh returned null — nothing spawned');
           showSpawnNotFound();
+          // Nothing is running and nothing will be: don't sit through a 40s
+          // timeout — quit shortly so the next launch starts clean.
+          setTimeout(() => quitApp(), 3000);
+          return;
         }
       }
       waitForDsh(ready => {
