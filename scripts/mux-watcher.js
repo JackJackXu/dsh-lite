@@ -25,7 +25,26 @@ if (!url) {
 let ws = null;
 let retryTimer = null;
 let closing = false;
-let failures = 0;
+// Connection attempt counter (reset to 0 on a successful open). Drives the
+// exponential backoff AND the quieted logging: a persistent failure (e.g. the
+// dsh 0.1.2 auth change the shell can't yet satisfy) must not spam one log
+// line every 5 seconds forever.
+let attempt = 0;
+
+const RECONNECT_BASE_MS = 5000;
+const RECONNECT_MAX_MS = 60000;
+
+function nextDelay() {
+  // 5s -> 10s -> 20s -> 40s -> capped at 60s.
+  return Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, Math.min(attempt, 4)));
+}
+
+// Log reconnects only when they are likely to tell us something new: the first
+// few, then each power-of-two attempt (4,8,16,…). Between those the failure is
+// unchanged and the delay is growing, so there is nothing to add.
+function shouldLogAttempt() {
+  return attempt <= 3 || (attempt & (attempt - 1)) === 0;
+}
 
 function connect() {
   if (closing) return;
@@ -37,7 +56,7 @@ function connect() {
     return;
   }
   ws.onopen = () => {
-    failures = 0;
+    attempt = 0;
     process.stderr.write('mux connected to ' + url + '\n');
   };
   ws.onmessage = (ev) => {
@@ -69,14 +88,15 @@ function connect() {
   };
   ws.onclose = (ev) => {
     ws = null;
-    process.stderr.write('mux closed (code ' + ev.code + ' ' + ev.reason + ')\n');
+    attempt += 1;
+    if (shouldLogAttempt()) {
+      process.stderr.write('mux closed (code ' + ev.code + ' ' + (ev.reason || '') + '), reconnect #' + attempt + ' in ' + Math.round(nextDelay() / 1000) + 's\n');
+    }
     scheduleReconnect();
   };
-  ws.onerror = (ev) => {
-    failures += 1;
-    process.stderr.write('mux error (attempt ' + failures + '): ' + (ev && ev.message ? ev.message : String(ev)) + '\n');
-    try { ws.close(); } catch { /* ignore */ }
-  };
+  // Swallow the error event: its close always follows, and onclose owns the
+  // reconnect + logging (avoids double-counting a single failure).
+  ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
 }
 
 function scheduleReconnect() {
@@ -84,7 +104,7 @@ function scheduleReconnect() {
   retryTimer = setTimeout(() => {
     retryTimer = null;
     connect();
-  }, 5000);
+  }, nextDelay());
 }
 
 connect();
