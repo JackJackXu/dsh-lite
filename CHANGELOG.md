@@ -2,6 +2,18 @@
 
 本文件的格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] — 2026-09-05
+
+### 变更
+
+- **启动加载页**：启动即建窗显示本地 loading 页，dsh 就绪后再载入 WebUI（告别"双击后黑屏/无反馈等待"）
+- **开机自启开关**：托盘「Launch at Login」勾选即随 Windows 启动，持久化
+- **settings 加 schemaVersion**：为将来字段迁移预留单一路径（v1 无字段变更）
+- **mux watcher 断连退避 + 日志降噪**：5s→60s 指数退避；只在状态变化时打日志（修掉 `code 1006` 每 5s 刷屏）
+- **CI 产 Windows 安装包**：GitHub Actions 每次 push 自动打包并上传 artifact（不再只在本地手打）
+- 新增 `ARCHITECTURE.md`：完整体检结论 + 明确暂缓/不做项及原因
+- 版本号 1.0.2 → 1.1.0
+
 ## [1.0.2] — 2026-09-05
 
 ### 变更
